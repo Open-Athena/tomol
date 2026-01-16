@@ -690,19 +690,7 @@ def main():
 
         return {"position": pos_err, "force": force_err, "energy": energy_err}
 
-    print("\n" + "=" * 60)
-    print("Reconstruction Quality Evaluation")
-    print("=" * 60)
-
-    # Evaluate on training data
-    train_errors = evaluate_reconstruction(positions, forces, energies, "TRAIN")
-
-    # Evaluate on validation data if available
-    val_errors = None
-    if val_positions is not None:
-        val_errors = evaluate_reconstruction(val_positions, val_forces, val_energies, "VALIDATION")
-
-    # Save codebooks
+    # Save codebooks before evaluation
     result = {
         "config": {
             "pos_levels": args.pos_levels,
@@ -730,10 +718,6 @@ def main():
             "force_z": force_boundaries["z"],
             "energy": energy_boundaries,  # List of (K-1,) arrays
         },
-        "reconstruction_errors": {
-            "train": train_errors,
-            "val": val_errors,
-        },
     }
 
     output_path = Path(args.output)
@@ -743,6 +727,17 @@ def main():
     print(f"\nCodebooks saved to {output_path}")
     print(f"Position: {args.codebook_size} entries x {args.pos_levels} levels = {args.codebook_size * args.pos_levels} codes")
     print(f"Forces/Energy: {args.codebook_size} entries x {args.n_levels} levels = {args.codebook_size * args.n_levels} codes each")
+
+    print("\n" + "=" * 60)
+    print("Reconstruction Quality Evaluation")
+    print("=" * 60)
+
+    # Evaluate on training data
+    train_errors = evaluate_reconstruction(positions, forces, energies, "TRAIN")
+
+    # Evaluate on validation data if available
+    if val_positions is not None:
+        evaluate_reconstruction(val_positions, val_forces, val_energies, "VALIDATION")
 
 
 if __name__ == "__main__":
