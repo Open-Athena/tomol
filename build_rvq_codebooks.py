@@ -191,26 +191,58 @@ def build_rvq_codebook_3d(
     # Quantile indices for selecting codebook entries
     quantile_fracs = (np.arange(codebook_size) + 0.5) / codebook_size
 
+    # Quantile fracs for K-1 entries (reserving one for zero bucket)
+    quantile_fracs_km1 = (np.arange(codebook_size - 1) + 0.5) / (codebook_size - 1)
+
     for level in range(n_levels):
         print(f"  Level {level + 1}/{n_levels}: computing Morton-quantile codebook with K={codebook_size}...")
 
-        # Normalize residuals to [0, 1] range for Morton encoding
-        mins = residuals.min(axis=0)
-        maxs = residuals.max(axis=0)
-        ranges = maxs - mins
-        ranges[ranges == 0] = 1.0  # Avoid division by zero
-        normalized = (residuals - mins) / ranges
+        # Filter out points with very small residuals (norm < 0.0001)
+        residual_norms = np.linalg.norm(residuals, axis=1)
+        significant_mask = residual_norms >= 0.0001
+        significant_residuals = residuals[significant_mask]
+        n_significant = significant_mask.sum()
 
-        # Discretize to 10-bit integers (0-1023)
-        discretized = (normalized * 1023).astype(np.int32).clip(0, 1023)
+        # If too few significant residuals, fall back to standard quantiles on all data
+        if len(significant_residuals) < codebook_size - 1:
+            print(f"    Note: Only {n_significant} points with residual >= 0.0001, using standard quantiles")
+            # Normalize residuals to [0, 1] range for Morton encoding
+            mins = residuals.min(axis=0)
+            maxs = residuals.max(axis=0)
+            ranges = maxs - mins
+            ranges[ranges == 0] = 1.0
+            normalized = (residuals - mins) / ranges
+            discretized = (normalized * 1023).astype(np.int32).clip(0, 1023)
+            morton_codes = _morton_code(discretized[:, 0], discretized[:, 1], discretized[:, 2])
+            sorted_indices = np.argsort(morton_codes)
+            quantile_indices = (quantile_fracs * (len(residuals) - 1)).astype(int)
+            codebook = residuals[sorted_indices[quantile_indices]]
+        else:
+            # Reserve bucket 0 for near-zero residuals (centroid = [0,0,0])
+            # Use K-1 quantile entries for significant residuals
+            print(f"    Using zero bucket + {codebook_size - 1} quantile entries ({n_significant} significant points)")
 
-        # Compute Morton codes and sort
-        morton_codes = _morton_code(discretized[:, 0], discretized[:, 1], discretized[:, 2])
-        sorted_indices = np.argsort(morton_codes)
+            # Normalize significant residuals to [0, 1] range for Morton encoding
+            mins = significant_residuals.min(axis=0)
+            maxs = significant_residuals.max(axis=0)
+            ranges = maxs - mins
+            ranges[ranges == 0] = 1.0
+            normalized = (significant_residuals - mins) / ranges
 
-        # Select codebook entries at quantile positions along Morton curve
-        quantile_indices = (quantile_fracs * (len(residuals) - 1)).astype(int)
-        codebook = residuals[sorted_indices[quantile_indices]]
+            # Discretize to 10-bit integers (0-1023)
+            discretized = (normalized * 1023).astype(np.int32).clip(0, 1023)
+
+            # Compute Morton codes and sort
+            morton_codes = _morton_code(discretized[:, 0], discretized[:, 1], discretized[:, 2])
+            sorted_indices = np.argsort(morton_codes)
+
+            # Select K-1 codebook entries at quantile positions along Morton curve
+            quantile_indices = (quantile_fracs_km1 * (len(significant_residuals) - 1)).astype(int)
+            significant_codebook = significant_residuals[sorted_indices[quantile_indices]]
+
+            # Prepend zero vector as bucket 0
+            codebook = np.vstack([np.zeros((1, 3)), significant_codebook])
+
         codebooks.append(codebook)
 
         # Assign each vector to nearest codebook entry and compute residuals
@@ -312,15 +344,38 @@ def build_rvq_codebook_1d(
 
     # Percentiles for bin centers (centroids): 0.5/K, 1.5/K, ..., (K-0.5)/K
     centroid_percentiles = (np.arange(codebook_size) + 0.5) / codebook_size * 100
-    # Percentiles for boundaries: 1/K, 2/K, ..., (K-1)/K
-    boundary_percentiles = np.arange(1, codebook_size) / codebook_size * 100
+    # Percentiles for K-1 entries (reserving one for zero bucket)
+    centroid_percentiles_km1 = (np.arange(codebook_size - 1) + 0.5) / (codebook_size - 1) * 100
+
+    threshold = 0.0001
 
     for level in range(n_levels):
         print(f"  Level {level + 1}/{n_levels}: computing quantile codebook with K={codebook_size}...")
 
-        # Compute quantile-based codebook entries (centroids) and boundaries
-        codebook = np.percentile(residuals, centroid_percentiles)
-        boundaries = np.percentile(residuals, boundary_percentiles)
+        # Filter out points with very small residuals (|residual| < threshold)
+        significant_mask = np.abs(residuals) >= threshold
+        significant_residuals = residuals[significant_mask]
+        n_significant = significant_mask.sum()
+
+        # If too few significant residuals, fall back to standard quantiles on all data
+        if len(significant_residuals) < codebook_size - 1:
+            print(f"    Note: Only {n_significant} points with |residual| >= {threshold}, using standard quantiles")
+            codebook = np.percentile(residuals, centroid_percentiles)
+            boundaries = (codebook[:-1] + codebook[1:]) / 2
+        else:
+            # Reserve one bucket for near-zero residuals (centroid = 0)
+            # Use K-1 quantile entries for significant residuals
+            print(f"    Using zero bucket + {codebook_size - 1} quantile entries ({n_significant} significant points)")
+
+            # Compute K-1 quantile centroids for significant residuals
+            significant_centroids = np.percentile(significant_residuals, centroid_percentiles_km1)
+
+            # Insert zero centroid and sort
+            codebook = np.sort(np.concatenate([[0.0], significant_centroids]))
+
+            # Compute boundaries as midpoints between adjacent centroids
+            boundaries = (codebook[:-1] + codebook[1:]) / 2
+
         codebooks.append(codebook)
         all_boundaries.append(boundaries)
 
