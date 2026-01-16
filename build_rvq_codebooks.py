@@ -226,9 +226,12 @@ def build_rvq_codebook_1d(
     codebook_size: int,
     random_state: int = 42,
     sample_size: int | None = None,
-) -> list[np.ndarray]:
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """
     Build RVQ codebooks for 1D scalar values (force components, energies) using quantile binning.
+
+    Uses boundary-based assignment: determines which quantile bucket a value falls into
+    using boundaries, then assigns the centroid of that bucket.
 
     Args:
         values: (N,) array of scalar values
@@ -238,7 +241,8 @@ def build_rvq_codebook_1d(
         sample_size: If provided, subsample values for faster training
 
     Returns:
-        codebooks: List of L arrays, each of shape (K,)
+        codebooks: List of L arrays, each of shape (K,) - centroids for each bin
+        boundaries: List of L arrays, each of shape (K-1,) - boundaries between bins
     """
     if sample_size is not None and len(values) > sample_size:
         rng = np.random.default_rng(random_state)
@@ -246,27 +250,31 @@ def build_rvq_codebook_1d(
         values = values[indices]
 
     codebooks = []
+    all_boundaries = []
     residuals = values.copy()
 
-    # Percentiles for bin centers: 0.5/K, 1.5/K, ..., (K-0.5)/K
-    percentiles = (np.arange(codebook_size) + 0.5) / codebook_size * 100
+    # Percentiles for bin centers (centroids): 0.5/K, 1.5/K, ..., (K-0.5)/K
+    centroid_percentiles = (np.arange(codebook_size) + 0.5) / codebook_size * 100
+    # Percentiles for boundaries: 1/K, 2/K, ..., (K-1)/K
+    boundary_percentiles = np.arange(1, codebook_size) / codebook_size * 100
 
     for level in range(n_levels):
         print(f"  Level {level + 1}/{n_levels}: computing quantile codebook with K={codebook_size}...")
 
-        # Compute quantile-based codebook entries
-        codebook = np.percentile(residuals, percentiles)
+        # Compute quantile-based codebook entries (centroids) and boundaries
+        codebook = np.percentile(residuals, centroid_percentiles)
+        boundaries = np.percentile(residuals, boundary_percentiles)
         codebooks.append(codebook)
+        all_boundaries.append(boundaries)
 
-        # Assign each value to nearest codebook entry and compute residuals
-        dists = np.abs(residuals[:, None] - codebook[None, :])
-        assignments = np.argmin(dists, axis=1)
+        # Assign using boundaries: find which bin each value falls into
+        assignments = np.searchsorted(boundaries, residuals)
         residuals = residuals - codebook[assignments]
 
         residual_rms = np.sqrt(np.mean(residuals ** 2))
         print(f"    Residual RMS: {residual_rms:.6f}")
 
-    return codebooks
+    return codebooks, all_boundaries
 
 
 def encode_positions(positions: np.ndarray, codebooks: list[np.ndarray]) -> np.ndarray:
@@ -293,13 +301,14 @@ def encode_positions(positions: np.ndarray, codebooks: list[np.ndarray]) -> np.n
     return codes
 
 
-def encode_1d(values: np.ndarray, codebooks: list[np.ndarray]) -> np.ndarray:
+def encode_1d(values: np.ndarray, codebooks: list[np.ndarray], boundaries: list[np.ndarray]) -> np.ndarray:
     """
-    Encode 1D values using RVQ codebooks.
+    Encode 1D values using RVQ codebooks with boundary-based assignment.
 
     Args:
         values: (N,) scalar values
-        codebooks: List of L codebooks, each (K,)
+        codebooks: List of L codebooks, each (K,) - centroids for each bin
+        boundaries: List of L arrays, each (K-1,) - boundaries between bins
 
     Returns:
         codes: (N, L) array of codebook indices
@@ -308,10 +317,9 @@ def encode_1d(values: np.ndarray, codebooks: list[np.ndarray]) -> np.ndarray:
     codes = np.zeros((len(values), n_levels), dtype=np.int32)
     residuals = values.copy()
 
-    for level, codebook in enumerate(codebooks):
-        # Find nearest centroid
-        dists = np.abs(residuals[:, None] - codebook[None, :])
-        codes[:, level] = np.argmin(dists, axis=1)
+    for level, (codebook, level_boundaries) in enumerate(zip(codebooks, boundaries)):
+        # Assign using boundaries: find which bin each value falls into
+        codes[:, level] = np.searchsorted(level_boundaries, residuals)
         residuals = residuals - codebook[codes[:, level]]
 
     return codes
@@ -354,10 +362,12 @@ def decode_1d(codes: np.ndarray, codebooks: list[np.ndarray]) -> np.ndarray:
 def compute_reconstruction_error(original: np.ndarray, reconstructed: np.ndarray) -> dict:
     """Compute reconstruction error statistics."""
     error = original - reconstructed
+    abs_error = np.abs(error)
     return {
-        "mae": np.mean(np.abs(error)),
+        "mae": np.mean(abs_error),
+        "median_error": np.median(abs_error),
         "rmse": np.sqrt(np.mean(error ** 2)),
-        "max_error": np.max(np.abs(error)),
+        "max_error": np.max(abs_error),
     }
 
 
@@ -427,7 +437,7 @@ def main():
     )
 
     print("\nBuilding force_x codebooks...")
-    force_x_cb = build_rvq_codebook_1d(
+    force_x_cb, force_x_bounds = build_rvq_codebook_1d(
         all_forces[:, 0].copy(),
         n_levels=args.n_levels,
         codebook_size=args.codebook_size,
@@ -436,7 +446,7 @@ def main():
     )
 
     print("\nBuilding force_y codebooks...")
-    force_y_cb = build_rvq_codebook_1d(
+    force_y_cb, force_y_bounds = build_rvq_codebook_1d(
         all_forces[:, 1].copy(),
         n_levels=args.n_levels,
         codebook_size=args.codebook_size,
@@ -445,7 +455,7 @@ def main():
     )
 
     print("\nBuilding force_z codebooks...")
-    force_z_cb = build_rvq_codebook_1d(
+    force_z_cb, force_z_bounds = build_rvq_codebook_1d(
         all_forces[:, 2].copy(),
         n_levels=args.n_levels,
         codebook_size=args.codebook_size,
@@ -454,7 +464,7 @@ def main():
     )
 
     print("\nBuilding energy codebooks...")
-    energy_codebooks = build_rvq_codebook_1d(
+    energy_codebooks, energy_boundaries = build_rvq_codebook_1d(
         all_energies,
         n_levels=args.n_levels,
         codebook_size=args.codebook_size,
@@ -463,6 +473,7 @@ def main():
     )
 
     force_codebooks = {"x": force_x_cb, "y": force_y_cb, "z": force_z_cb}
+    force_boundaries = {"x": force_x_bounds, "y": force_y_bounds, "z": force_z_bounds}
     print("\nAll codebooks built successfully.")
 
     # Evaluate reconstruction quality
@@ -480,21 +491,21 @@ def main():
         pos_codes = encode_positions(pos_data, pos_codebooks)
         pos_reconstructed = decode_positions(pos_codes, pos_codebooks)
         pos_err = compute_reconstruction_error(pos_data, pos_reconstructed)
-        print(f"  Position - MAE: {pos_err['mae']:.6f}, RMSE: {pos_err['rmse']:.6f}, Max: {pos_err['max_error']:.6f}")
+        print(f"  Position - MAE: {pos_err['mae']:.6f}, Median: {pos_err['median_error']:.6f}, RMSE: {pos_err['rmse']:.6f}, Max: {pos_err['max_error']:.6f}")
 
         # Force reconstruction
         force_reconstructed = np.zeros_like(force_data)
         for i, component in enumerate(["x", "y", "z"]):
-            codes = encode_1d(force_data[:, i], force_codebooks[component])
+            codes = encode_1d(force_data[:, i], force_codebooks[component], force_boundaries[component])
             force_reconstructed[:, i] = decode_1d(codes, force_codebooks[component])
         force_err = compute_reconstruction_error(force_data, force_reconstructed)
-        print(f"  Force    - MAE: {force_err['mae']:.6f}, RMSE: {force_err['rmse']:.6f}, Max: {force_err['max_error']:.6f}")
+        print(f"  Force    - MAE: {force_err['mae']:.6f}, Median: {force_err['median_error']:.6f}, RMSE: {force_err['rmse']:.6f}, Max: {force_err['max_error']:.6f}")
 
         # Energy reconstruction
-        energy_codes = encode_1d(energy_data, energy_codebooks)
+        energy_codes = encode_1d(energy_data, energy_codebooks, energy_boundaries)
         energy_reconstructed = decode_1d(energy_codes, energy_codebooks)
         energy_err = compute_reconstruction_error(energy_data, energy_reconstructed)
-        print(f"  Energy   - MAE: {energy_err['mae']:.6f}, RMSE: {energy_err['rmse']:.6f}, Max: {energy_err['max_error']:.6f}")
+        print(f"  Energy   - MAE: {energy_err['mae']:.6f}, Median: {energy_err['median_error']:.6f}, RMSE: {energy_err['rmse']:.6f}, Max: {energy_err['max_error']:.6f}")
 
         return {"position": pos_err, "force": force_err, "energy": energy_err}
 
@@ -530,6 +541,12 @@ def main():
             "force_y": force_codebooks["y"],
             "force_z": force_codebooks["z"],
             "energy": energy_codebooks,  # List of (K,) arrays
+        },
+        "boundaries": {
+            "force_x": force_boundaries["x"],  # List of (K-1,) arrays
+            "force_y": force_boundaries["y"],
+            "force_z": force_boundaries["z"],
+            "energy": energy_boundaries,  # List of (K-1,) arrays
         },
         "reconstruction_errors": {
             "train": train_errors,
