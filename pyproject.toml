@@ -1,0 +1,13 @@
+[project]
+name = "moltok"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=3.0.0",
+    "huggingface-hub>=0.25.0",
+    "numpy>=2.4.1",
+    "pandas>=2.3.3",
+    "tqdm>=4.67.1",
+]
