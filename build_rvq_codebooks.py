@@ -1,9 +1,12 @@
 """
 Build Residual Vector Quantization (RVQ) codebooks for molecular data.
 
-Uses quantile binning instead of K-Means for faster, deterministic codebook construction.
-Positions use Morton (Z-order) curve to map 3D to 1D while preserving spatial locality.
-Forces and energies use direct 1D quantile binning on scalar values.
+Supports two methods for codebook construction:
+- quantile: Fast, deterministic binning using quantile positions (default)
+- kmeans: K-means clustering for potentially better reconstruction
+
+Positions use Morton (Z-order) curve to map 3D to 1D while preserving spatial locality (quantile mode).
+Forces and energies use direct 1D binning on scalar values.
 """
 
 import argparse
@@ -13,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.cluster import KMeans
 from tqdm import tqdm
 
 
@@ -220,6 +224,59 @@ def build_rvq_codebook_3d(
     return codebooks
 
 
+def build_rvq_codebook_3d_kmeans(
+    vectors: np.ndarray,
+    n_levels: int,
+    codebook_size: int,
+    random_state: int = 42,
+    sample_size: int | None = None,
+) -> list[np.ndarray]:
+    """
+    Build RVQ codebooks for 3D vectors using k-means clustering.
+
+    Args:
+        vectors: (N, 3) array of vectors
+        n_levels: Number of RVQ levels
+        codebook_size: Number of entries per codebook (K)
+        random_state: Random seed for reproducibility
+        sample_size: If provided, subsample vectors for faster training
+
+    Returns:
+        codebooks: List of L arrays, each of shape (K, 3)
+    """
+    if sample_size is not None and len(vectors) > sample_size:
+        rng = np.random.default_rng(random_state)
+        indices = rng.choice(len(vectors), sample_size, replace=False)
+        vectors = vectors[indices]
+
+    codebooks = []
+    residuals = vectors.copy()
+
+    for level in range(n_levels):
+        print(f"  Level {level + 1}/{n_levels}: computing k-means codebook with K={codebook_size}...")
+
+        # Fit k-means on residuals
+        kmeans = KMeans(
+            n_clusters=codebook_size,
+            random_state=random_state + level,
+            n_init=10,
+        )
+        kmeans.fit(residuals)
+
+        codebook = kmeans.cluster_centers_
+        codebooks.append(codebook)
+
+        # Assign each vector to nearest codebook entry and compute residuals
+        dists = np.linalg.norm(residuals[:, None, :] - codebook[None, :, :], axis=2)
+        assignments = np.argmin(dists, axis=1)
+        residuals = residuals - codebook[assignments]
+
+        residual_rms = np.sqrt(np.mean(residuals ** 2))
+        print(f"    Residual RMS: {residual_rms:.6f}")
+
+    return codebooks
+
+
 def build_rvq_codebook_1d(
     values: np.ndarray,
     n_levels: int,
@@ -268,6 +325,65 @@ def build_rvq_codebook_1d(
         all_boundaries.append(boundaries)
 
         # Assign using boundaries: find which bin each value falls into
+        assignments = np.searchsorted(boundaries, residuals)
+        residuals = residuals - codebook[assignments]
+
+        residual_rms = np.sqrt(np.mean(residuals ** 2))
+        print(f"    Residual RMS: {residual_rms:.6f}")
+
+    return codebooks, all_boundaries
+
+
+def build_rvq_codebook_1d_kmeans(
+    values: np.ndarray,
+    n_levels: int,
+    codebook_size: int,
+    random_state: int = 42,
+    sample_size: int | None = None,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """
+    Build RVQ codebooks for 1D scalar values using k-means clustering.
+
+    Args:
+        values: (N,) array of scalar values
+        n_levels: Number of RVQ levels
+        codebook_size: Number of entries per codebook (K)
+        random_state: Random seed for reproducibility
+        sample_size: If provided, subsample values for faster training
+
+    Returns:
+        codebooks: List of L arrays, each of shape (K,) - centroids for each bin
+        boundaries: List of L arrays, each of shape (K-1,) - boundaries between bins
+    """
+    if sample_size is not None and len(values) > sample_size:
+        rng = np.random.default_rng(random_state)
+        indices = rng.choice(len(values), sample_size, replace=False)
+        values = values[indices]
+
+    codebooks = []
+    all_boundaries = []
+    residuals = values.copy()
+
+    for level in range(n_levels):
+        print(f"  Level {level + 1}/{n_levels}: computing k-means codebook with K={codebook_size}...")
+
+        # Fit k-means on residuals (reshape to 2D for sklearn)
+        kmeans = KMeans(
+            n_clusters=codebook_size,
+            random_state=random_state + level,
+            n_init=10,
+        )
+        kmeans.fit(residuals.reshape(-1, 1))
+
+        # Get sorted centroids (1D)
+        codebook = np.sort(kmeans.cluster_centers_.flatten())
+        codebooks.append(codebook)
+
+        # Compute boundaries as midpoints between adjacent centroids
+        boundaries = (codebook[:-1] + codebook[1:]) / 2
+        all_boundaries.append(boundaries)
+
+        # Assign using boundaries and compute residuals
         assignments = np.searchsorted(boundaries, residuals)
         residuals = residuals - codebook[assignments]
 
@@ -380,8 +496,10 @@ def main():
     parser.add_argument("--codebook-size", "-K", type=int, default=256, help="Codebook size per level")
     parser.add_argument("--train-rows", type=int, default=None, help="Number of rows for training")
     parser.add_argument("--val-rows", type=int, default=None, help="Number of rows for validation")
-    parser.add_argument("--sample-size", type=int, default=500000, help="Sample size for k-means training")
+    parser.add_argument("--sample-size", type=int, default=500000, help="Sample size for codebook training")
     parser.add_argument("--random-state", type=int, default=42, help="Random seed")
+    parser.add_argument("--method", type=str, default="quantile", choices=["quantile", "kmeans"],
+                        help="Codebook construction method: 'quantile' (fast, deterministic) or 'kmeans' (slower, potentially better)")
     args = parser.parse_args()
 
     # Determine total rows to load
@@ -422,13 +540,21 @@ def main():
     all_energies, energy_scale, energy_shift = preprocess_energies(energies)
 
     # Build codebooks
-    print(f"\nBuilding codebooks...")
+    print(f"\nBuilding codebooks (method: {args.method})...")
     print(f"  - Position: 3D RVQ, L={args.pos_levels}, K={args.codebook_size}")
     print(f"  - Forces (x,y,z): 1D RVQ, L={args.n_levels}, K={args.codebook_size}")
     print(f"  - Energy: 1D RVQ, L={args.n_levels}, K={args.codebook_size}")
 
+    # Select codebook building functions based on method
+    if args.method == "kmeans":
+        build_3d = build_rvq_codebook_3d_kmeans
+        build_1d = build_rvq_codebook_1d_kmeans
+    else:
+        build_3d = build_rvq_codebook_3d
+        build_1d = build_rvq_codebook_1d
+
     print("\nBuilding position codebooks...")
-    pos_codebooks = build_rvq_codebook_3d(
+    pos_codebooks = build_3d(
         all_positions,
         n_levels=args.pos_levels,
         codebook_size=args.codebook_size,
@@ -437,7 +563,7 @@ def main():
     )
 
     print("\nBuilding force_x codebooks...")
-    force_x_cb, force_x_bounds = build_rvq_codebook_1d(
+    force_x_cb, force_x_bounds = build_1d(
         all_forces[:, 0].copy(),
         n_levels=args.n_levels,
         codebook_size=args.codebook_size,
@@ -446,7 +572,7 @@ def main():
     )
 
     print("\nBuilding force_y codebooks...")
-    force_y_cb, force_y_bounds = build_rvq_codebook_1d(
+    force_y_cb, force_y_bounds = build_1d(
         all_forces[:, 1].copy(),
         n_levels=args.n_levels,
         codebook_size=args.codebook_size,
@@ -455,7 +581,7 @@ def main():
     )
 
     print("\nBuilding force_z codebooks...")
-    force_z_cb, force_z_bounds = build_rvq_codebook_1d(
+    force_z_cb, force_z_bounds = build_1d(
         all_forces[:, 2].copy(),
         n_levels=args.n_levels,
         codebook_size=args.codebook_size,
@@ -464,7 +590,7 @@ def main():
     )
 
     print("\nBuilding energy codebooks...")
-    energy_codebooks, energy_boundaries = build_rvq_codebook_1d(
+    energy_codebooks, energy_boundaries = build_1d(
         all_energies,
         n_levels=args.n_levels,
         codebook_size=args.codebook_size,
@@ -528,6 +654,7 @@ def main():
             "n_levels": args.n_levels,
             "codebook_size": args.codebook_size,
             "random_state": args.random_state,
+            "method": args.method,
         },
         "preprocessing": {
             "position_scale": pos_scale,
