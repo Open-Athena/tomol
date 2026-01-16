@@ -448,25 +448,30 @@ def build_rvq_codebook_1d_kmeans(
     return codebooks, all_boundaries
 
 
-def encode_positions(positions: np.ndarray, codebooks: list[np.ndarray]) -> np.ndarray:
+def encode_positions(positions: np.ndarray, codebooks: list[np.ndarray], batch_size: int = 100000) -> np.ndarray:
     """
     Encode positions using RVQ codebooks.
 
     Args:
         positions: (N, 3) centered and scaled position vectors
         codebooks: List of L codebooks, each (K, 3)
+        batch_size: Process this many vectors at a time to avoid OOM
 
     Returns:
         codes: (N, L) array of codebook indices
     """
     n_levels = len(codebooks)
-    codes = np.zeros((len(positions), n_levels), dtype=np.int32)
+    n_positions = len(positions)
+    codes = np.zeros((n_positions, n_levels), dtype=np.int32)
     residuals = positions.copy()
 
     for level, codebook in enumerate(codebooks):
-        # Find nearest centroid
-        dists = np.linalg.norm(residuals[:, None, :] - codebook[None, :, :], axis=2)
-        codes[:, level] = np.argmin(dists, axis=1)
+        # Process in batches to avoid OOM
+        for start in range(0, n_positions, batch_size):
+            end = min(start + batch_size, n_positions)
+            batch_residuals = residuals[start:end]
+            dists = np.linalg.norm(batch_residuals[:, None, :] - codebook[None, :, :], axis=2)
+            codes[start:end, level] = np.argmin(dists, axis=1)
         residuals = residuals - codebook[codes[:, level]]
 
     return codes
@@ -557,12 +562,44 @@ def main():
                         help="Codebook construction method: 'quantile' (fast, deterministic) or 'kmeans' (slower, potentially better)")
     args = parser.parse_args()
 
-    # Determine total rows to load
+    output_path = Path(args.output)
+
+    # Check if checkpoint already exists
+    if output_path.exists():
+        import warnings
+        warnings.warn(f"Checkpoint {output_path} already exists. Skipping training and running evaluation only.")
+
+        print(f"\nLoading existing codebooks from {output_path}...")
+        with open(output_path, "rb") as f:
+            result = pickle.load(f)
+
+        # Extract codebooks and preprocessing params
+        pos_codebooks = result["codebooks"]["position"]
+        force_codebooks = {
+            "x": result["codebooks"]["force_x"],
+            "y": result["codebooks"]["force_y"],
+            "z": result["codebooks"]["force_z"],
+        }
+        force_boundaries = {
+            "x": result["boundaries"]["force_x"],
+            "y": result["boundaries"]["force_y"],
+            "z": result["boundaries"]["force_z"],
+        }
+        energy_codebooks = result["codebooks"]["energy"]
+        energy_boundaries = result["boundaries"]["energy"]
+
+        pos_scale = result["preprocessing"]["position_scale"]
+        force_scale = result["preprocessing"]["force_scale"]
+        energy_scale = result["preprocessing"]["energy_scale"]
+        energy_shift = result["preprocessing"]["energy_shift"]
+
+        print(f"Loaded codebooks (method: {result['config'].get('method', 'unknown')})")
+
+    # Load data for evaluation (needed whether training or loading from checkpoint)
     max_rows = None
     if args.train_rows is not None:
         max_rows = args.train_rows + (args.val_rows or 0)
 
-    # Load data
     positions, forces, energies = load_data(args.input_csv, max_rows)
 
     # Split into train/val
@@ -584,78 +621,116 @@ def main():
 
     positions, forces, energies = train_positions, train_forces, train_energies
 
-    # Preprocess
-    print("\nPreprocessing positions...")
-    all_positions, pos_scale = preprocess_positions(positions)
+    if not output_path.exists():
+        # Preprocess
+        print("\nPreprocessing positions...")
+        all_positions, pos_scale = preprocess_positions(positions)
 
-    print("\nPreprocessing forces...")
-    all_forces, force_scale = preprocess_forces(forces)
+        print("\nPreprocessing forces...")
+        all_forces, force_scale = preprocess_forces(forces)
 
-    print("\nPreprocessing energies...")
-    all_energies, energy_scale, energy_shift = preprocess_energies(energies)
+        print("\nPreprocessing energies...")
+        all_energies, energy_scale, energy_shift = preprocess_energies(energies)
 
-    # Build codebooks
-    print(f"\nBuilding codebooks (method: {args.method})...")
-    print(f"  - Position: 3D RVQ, L={args.pos_levels}, K={args.codebook_size}")
-    print(f"  - Forces (x,y,z): 1D RVQ, L={args.n_levels}, K={args.codebook_size}")
-    print(f"  - Energy: 1D RVQ, L={args.n_levels}, K={args.codebook_size}")
+        # Build codebooks
+        print(f"\nBuilding codebooks (method: {args.method})...")
+        print(f"  - Position: 3D RVQ, L={args.pos_levels}, K={args.codebook_size}")
+        print(f"  - Forces (x,y,z): 1D RVQ, L={args.n_levels}, K={args.codebook_size}")
+        print(f"  - Energy: 1D RVQ, L={args.n_levels}, K={args.codebook_size}")
 
-    # Select codebook building functions based on method
-    if args.method == "kmeans":
-        build_3d = build_rvq_codebook_3d_kmeans
-        build_1d = build_rvq_codebook_1d_kmeans
-    else:
-        build_3d = build_rvq_codebook_3d
-        build_1d = build_rvq_codebook_1d
+        # Select codebook building functions based on method
+        if args.method == "kmeans":
+            build_3d = build_rvq_codebook_3d_kmeans
+            build_1d = build_rvq_codebook_1d_kmeans
+        else:
+            build_3d = build_rvq_codebook_3d
+            build_1d = build_rvq_codebook_1d
 
-    print("\nBuilding position codebooks...")
-    pos_codebooks = build_3d(
-        all_positions,
-        n_levels=args.pos_levels,
-        codebook_size=args.codebook_size,
-        random_state=args.random_state,
-        sample_size=args.sample_size,
-    )
+        print("\nBuilding position codebooks...")
+        pos_codebooks = build_3d(
+            all_positions,
+            n_levels=args.pos_levels,
+            codebook_size=args.codebook_size,
+            random_state=args.random_state,
+            sample_size=args.sample_size,
+        )
 
-    print("\nBuilding force_x codebooks...")
-    force_x_cb, force_x_bounds = build_1d(
-        all_forces[:, 0].copy(),
-        n_levels=args.n_levels,
-        codebook_size=args.codebook_size,
-        random_state=args.random_state,
-        sample_size=args.sample_size,
-    )
+        print("\nBuilding force_x codebooks...")
+        force_x_cb, force_x_bounds = build_1d(
+            all_forces[:, 0].copy(),
+            n_levels=args.n_levels,
+            codebook_size=args.codebook_size,
+            random_state=args.random_state,
+            sample_size=args.sample_size,
+        )
 
-    print("\nBuilding force_y codebooks...")
-    force_y_cb, force_y_bounds = build_1d(
-        all_forces[:, 1].copy(),
-        n_levels=args.n_levels,
-        codebook_size=args.codebook_size,
-        random_state=args.random_state + 100,
-        sample_size=args.sample_size,
-    )
+        print("\nBuilding force_y codebooks...")
+        force_y_cb, force_y_bounds = build_1d(
+            all_forces[:, 1].copy(),
+            n_levels=args.n_levels,
+            codebook_size=args.codebook_size,
+            random_state=args.random_state + 100,
+            sample_size=args.sample_size,
+        )
 
-    print("\nBuilding force_z codebooks...")
-    force_z_cb, force_z_bounds = build_1d(
-        all_forces[:, 2].copy(),
-        n_levels=args.n_levels,
-        codebook_size=args.codebook_size,
-        random_state=args.random_state + 200,
-        sample_size=args.sample_size,
-    )
+        print("\nBuilding force_z codebooks...")
+        force_z_cb, force_z_bounds = build_1d(
+            all_forces[:, 2].copy(),
+            n_levels=args.n_levels,
+            codebook_size=args.codebook_size,
+            random_state=args.random_state + 200,
+            sample_size=args.sample_size,
+        )
 
-    print("\nBuilding energy codebooks...")
-    energy_codebooks, energy_boundaries = build_1d(
-        all_energies,
-        n_levels=args.n_levels,
-        codebook_size=args.codebook_size,
-        random_state=args.random_state + 300,
-        sample_size=min(args.sample_size, len(all_energies)) if args.sample_size else None,
-    )
+        print("\nBuilding energy codebooks...")
+        energy_codebooks, energy_boundaries = build_1d(
+            all_energies,
+            n_levels=args.n_levels,
+            codebook_size=args.codebook_size,
+            random_state=args.random_state + 300,
+            sample_size=min(args.sample_size, len(all_energies)) if args.sample_size else None,
+        )
 
-    force_codebooks = {"x": force_x_cb, "y": force_y_cb, "z": force_z_cb}
-    force_boundaries = {"x": force_x_bounds, "y": force_y_bounds, "z": force_z_bounds}
-    print("\nAll codebooks built successfully.")
+        force_codebooks = {"x": force_x_cb, "y": force_y_cb, "z": force_z_cb}
+        force_boundaries = {"x": force_x_bounds, "y": force_y_bounds, "z": force_z_bounds}
+        print("\nAll codebooks built successfully.")
+
+        # Save codebooks before evaluation
+        result = {
+            "config": {
+                "pos_levels": args.pos_levels,
+                "n_levels": args.n_levels,
+                "codebook_size": args.codebook_size,
+                "random_state": args.random_state,
+                "method": args.method,
+            },
+            "preprocessing": {
+                "position_scale": pos_scale,
+                "force_scale": force_scale,
+                "energy_scale": energy_scale,
+                "energy_shift": energy_shift,
+            },
+            "codebooks": {
+                "position": pos_codebooks,  # List of (K, 3) arrays
+                "force_x": force_codebooks["x"],  # List of (K,) arrays
+                "force_y": force_codebooks["y"],
+                "force_z": force_codebooks["z"],
+                "energy": energy_codebooks,  # List of (K,) arrays
+            },
+            "boundaries": {
+                "force_x": force_boundaries["x"],  # List of (K-1,) arrays
+                "force_y": force_boundaries["y"],
+                "force_z": force_boundaries["z"],
+                "energy": energy_boundaries,  # List of (K-1,) arrays
+            },
+        }
+
+        with open(output_path, "wb") as f:
+            pickle.dump(result, f)
+
+        print(f"\nCodebooks saved to {output_path}")
+        print(f"Position: {args.codebook_size} entries x {args.pos_levels} levels = {args.codebook_size * args.pos_levels} codes")
+        print(f"Forces/Energy: {args.codebook_size} entries x {args.n_levels} levels = {args.codebook_size * args.n_levels} codes each")
 
     # Evaluate reconstruction quality
     def evaluate_reconstruction(positions_list, forces_list, energies_arr, label: str):
@@ -689,44 +764,6 @@ def main():
         print(f"  Energy   - MAE: {energy_err['mae']:.6f}, Median: {energy_err['median_error']:.6f}, RMSE: {energy_err['rmse']:.6f}, Max: {energy_err['max_error']:.6f}")
 
         return {"position": pos_err, "force": force_err, "energy": energy_err}
-
-    # Save codebooks before evaluation
-    result = {
-        "config": {
-            "pos_levels": args.pos_levels,
-            "n_levels": args.n_levels,
-            "codebook_size": args.codebook_size,
-            "random_state": args.random_state,
-            "method": args.method,
-        },
-        "preprocessing": {
-            "position_scale": pos_scale,
-            "force_scale": force_scale,
-            "energy_scale": energy_scale,
-            "energy_shift": energy_shift,
-        },
-        "codebooks": {
-            "position": pos_codebooks,  # List of (K, 3) arrays
-            "force_x": force_codebooks["x"],  # List of (K,) arrays
-            "force_y": force_codebooks["y"],
-            "force_z": force_codebooks["z"],
-            "energy": energy_codebooks,  # List of (K,) arrays
-        },
-        "boundaries": {
-            "force_x": force_boundaries["x"],  # List of (K-1,) arrays
-            "force_y": force_boundaries["y"],
-            "force_z": force_boundaries["z"],
-            "energy": energy_boundaries,  # List of (K-1,) arrays
-        },
-    }
-
-    output_path = Path(args.output)
-    with open(output_path, "wb") as f:
-        pickle.dump(result, f)
-
-    print(f"\nCodebooks saved to {output_path}")
-    print(f"Position: {args.codebook_size} entries x {args.pos_levels} levels = {args.codebook_size * args.pos_levels} codes")
-    print(f"Forces/Energy: {args.codebook_size} entries x {args.n_levels} levels = {args.codebook_size * args.n_levels} codes each")
 
     print("\n" + "=" * 60)
     print("Reconstruction Quality Evaluation")
