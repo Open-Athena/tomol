@@ -116,8 +116,11 @@ class ShardUploader:
 
     def _write_and_upload(self, texts: list[str], split: str, shard_idx: int):
         path = self.tmpdir / f"{split}-{shard_idx:05d}.parquet"
+        print(f"[upload] Writing {split}-{shard_idx:05d}.parquet ({len(texts):,} rows)...")
         pq.write_table(pa.table({"text": texts}), path)
+        print(f"[upload] Uploading {split}-{shard_idx:05d}.parquet ({path.stat().st_size / 1e6:.1f}MB)...")
         self.api.upload_file(str(path), f"data/{split}-{shard_idx:05d}.parquet", self.repo_id, repo_type="dataset")
+        print(f"[upload] Done {split}-{shard_idx:05d}.parquet")
         path.unlink()
 
     def finish(self):
