@@ -9,7 +9,7 @@ import multiprocessing as mp
 import random
 import shutil
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future
 from pathlib import Path
 from queue import Empty
 
@@ -17,6 +17,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from huggingface_hub import HfApi
+from huggingface_hub.utils import enable_progress_bars
 from tqdm import tqdm
 
 from serialize_molecules import MoleculeTokenizer
@@ -81,18 +82,17 @@ class ShardUploader:
         self.val_buffer: list[str] = []
         self.val_shard_idx = 0
 
-        self.upload_pool = ThreadPoolExecutor(4)
-        self.pending_uploads: list = []
+        self.pending_uploads: list[Future] = []
 
     def add_train(self, texts: list[str]):
         self.train_buffer.extend(texts)
-        print(f"[add_train] +{len(texts):,} -> buffer={len(self.train_buffer):,} (threshold={self.shard_size:,})")
+        tqdm.write(f"[add_train] +{len(texts):,} -> buffer={len(self.train_buffer):,} (threshold={self.shard_size:,})")
         while len(self.train_buffer) >= self.shard_size:
             self._flush_train()
 
     def add_val(self, texts: list[str]):
         self.val_buffer.extend(texts)
-        print(f"[add_val] +{len(texts):,} -> buffer={len(self.val_buffer):,} (threshold={self.shard_size:,})")
+        tqdm.write(f"[add_val] +{len(texts):,} -> buffer={len(self.val_buffer):,} (threshold={self.shard_size:,})")
         while len(self.val_buffer) >= self.shard_size:
             self._flush_val()
 
@@ -101,8 +101,7 @@ class ShardUploader:
             return
         shard = self.train_buffer[:self.shard_size]
         self.train_buffer = self.train_buffer[self.shard_size:]
-        print(f"Flushing train shard {self.train_shard_idx}: {len(shard):,} examples")
-        self.pending_uploads.append(self.upload_pool.submit(self._write_and_upload, shard, "train", self.train_shard_idx))
+        self._write_and_upload(shard, "train", self.train_shard_idx)
         self.train_shard_idx += 1
 
     def _flush_val(self):
@@ -110,30 +109,39 @@ class ShardUploader:
             return
         shard = self.val_buffer[:self.shard_size]
         self.val_buffer = self.val_buffer[self.shard_size:]
-        print(f"Flushing val shard {self.val_shard_idx}: {len(shard):,} examples")
-        self.pending_uploads.append(self.upload_pool.submit(self._write_and_upload, shard, "validation", self.val_shard_idx))
+        self._write_and_upload(shard, "validation", self.val_shard_idx)
         self.val_shard_idx += 1
 
     def _write_and_upload(self, texts: list[str], split: str, shard_idx: int):
         path = self.tmpdir / f"{split}-{shard_idx:05d}.parquet"
-        print(f"[upload] Writing {split}-{shard_idx:05d}.parquet ({len(texts):,} rows)...")
+        tqdm.write(f"[upload] Writing {split}-{shard_idx:05d}.parquet ({len(texts):,} rows)...")
         pq.write_table(pa.table({"text": texts}), path)
-        print(f"[upload] Uploading {split}-{shard_idx:05d}.parquet ({path.stat().st_size / 1e6:.1f}MB)...")
-        self.api.upload_file(str(path), f"data/{split}-{shard_idx:05d}.parquet", self.repo_id, repo_type="dataset")
-        print(f"[upload] Done {split}-{shard_idx:05d}.parquet")
-        path.unlink()
+        size_mb = path.stat().st_size / 1e6
+        tqdm.write(f"[upload] Uploading {split}-{shard_idx:05d}.parquet ({size_mb:.1f}MB)...")
+        # Use HF's run_as_future for background upload with progress
+        future = self.api.upload_file(
+            path_or_fileobj=str(path),
+            path_in_repo=f"data/{split}-{shard_idx:05d}.parquet",
+            repo_id=self.repo_id,
+            repo_type="dataset",
+            commit_message=f"Add {split}-{shard_idx:05d}",
+            run_as_future=True,
+        )
+        self.pending_uploads.append((future, path, f"{split}-{shard_idx:05d}"))
 
     def finish(self):
         """Flush remaining data and wait for all uploads."""
         if self.train_buffer:
-            print(f"Flushing final train shard {self.train_shard_idx}: {len(self.train_buffer):,} examples")
-            self.pending_uploads.append(self.upload_pool.submit(self._write_and_upload, self.train_buffer, "train", self.train_shard_idx))
+            tqdm.write(f"Flushing final train shard {self.train_shard_idx}: {len(self.train_buffer):,} examples")
+            self._write_and_upload(self.train_buffer, "train", self.train_shard_idx)
         if self.val_buffer:
-            print(f"Flushing final val shard {self.val_shard_idx}: {len(self.val_buffer):,} examples")
-            self.pending_uploads.append(self.upload_pool.submit(self._write_and_upload, self.val_buffer, "validation", self.val_shard_idx))
-        for f in tqdm(as_completed(self.pending_uploads), total=len(self.pending_uploads), desc="Uploading"):
-            f.result()
-        self.upload_pool.shutdown()
+            tqdm.write(f"Flushing final val shard {self.val_shard_idx}: {len(self.val_buffer):,} examples")
+            self._write_and_upload(self.val_buffer, "validation", self.val_shard_idx)
+        # Wait for all uploads to complete
+        for future, path, name in tqdm(self.pending_uploads, desc="Waiting for uploads"):
+            future.result()
+            tqdm.write(f"[upload] Done {name}.parquet")
+            path.unlink()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
@@ -166,6 +174,7 @@ def main():
     print(f"Validation: {len(val_indices):,}, Train: {total - len(val_indices):,}")
 
     # Setup uploader
+    enable_progress_bars()  # Ensure HF upload progress bars are shown
     api = HfApi()
     api.create_repo(args.repo_id, repo_type="dataset", exist_ok=True)
     uploader = ShardUploader(api, args.repo_id, shard_size=args.shard_size)
