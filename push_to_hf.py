@@ -11,8 +11,10 @@ This script:
 import argparse
 import os
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 
 import datasets
 import numpy as np
@@ -25,40 +27,74 @@ from serialize_molecules import MoleculeTokenizer
 DEFAULT_SHARD_SIZE = 100_000
 DEFAULT_NUM_WORKERS = 16
 BATCH_SIZE = 256  # Number of examples to batch before parallel processing
+PREFETCH_BATCHES = 4  # Number of batches to prefetch from stream
+
+# Global worker state for multiprocessing
+_worker_tokenizer: MoleculeTokenizer | None = None
+_worker_shuffle_sections: bool = False
 
 
-def serialize_example(
-    example: dict,
-    tokenizer: MoleculeTokenizer,
-    shuffle_sections: bool,
-    rng: np.random.Generator | None,
-) -> str:
-    """Serialize a single molecule example to text."""
+def _init_worker(codebook_path: str, shuffle_sections: bool):
+    """Initialize worker process with tokenizer."""
+    global _worker_tokenizer, _worker_shuffle_sections
+    _worker_tokenizer = MoleculeTokenizer(codebook_path)
+    _worker_shuffle_sections = shuffle_sections
+
+
+def _serialize_in_worker(args: tuple[dict, int | None]) -> str:
+    """Serialize a single example in worker process."""
+    example, seed = args
+    rng = np.random.default_rng(seed) if _worker_shuffle_sections and seed is not None else None
+
     atomic_numbers = example["atomic_numbers"]
     positions = np.array(example["positions"])
     forces = np.array(example["atomic_forces"])
     energy = float(example["energy"])
 
-    tokens = tokenizer.encode_molecule(
+    tokens = _worker_tokenizer.encode_molecule(
         atomic_numbers,
         positions,
         forces,
         energy,
-        shuffle_sections=shuffle_sections,
+        shuffle_sections=_worker_shuffle_sections,
         rng=rng,
     )
-    return tokenizer.tokens_to_string(tokens)
+    return _worker_tokenizer.tokens_to_string(tokens)
 
 
-def serialize_example_with_seed(
-    example: dict,
-    tokenizer: MoleculeTokenizer,
-    shuffle_sections: bool,
-    seed: int | None,
-) -> str:
-    """Serialize a single molecule example with its own RNG seed (thread-safe)."""
-    rng = np.random.default_rng(seed) if shuffle_sections and seed is not None else None
-    return serialize_example(example, tokenizer, shuffle_sections, rng)
+def prefetch_batches(
+    ds,
+    batch_size: int,
+    queue: Queue,
+    seed_rng: np.random.Generator | None,
+    max_rows: int | None,
+):
+    """Prefetch batches from streaming dataset into a queue."""
+    batch = []
+    batch_seeds = []
+    count = 0
+
+    for example in ds:
+        batch.append(example)
+        batch_seeds.append(
+            int(seed_rng.integers(0, 2**31)) if seed_rng is not None else None
+        )
+        count += 1
+
+        if len(batch) >= batch_size:
+            queue.put((batch, batch_seeds, count))
+            batch = []
+            batch_seeds = []
+
+        if max_rows is not None and count >= max_rows:
+            break
+
+    # Send final partial batch
+    if batch:
+        queue.put((batch, batch_seeds, count))
+
+    # Signal end of stream
+    queue.put(None)
 
 
 def serialize_and_push(
@@ -155,50 +191,55 @@ def serialize_and_push(
         shard_path.unlink()
         return shard_idx, count
 
-    def process_batch(
-        batch: list[dict], seeds: list[int | None]
-    ) -> list[str]:
-        """Process a batch of examples in parallel."""
-        with ThreadPoolExecutor(max_workers=num_workers) as proc_executor:
-            futures = [
-                proc_executor.submit(
-                    serialize_example_with_seed, ex, tokenizer, shuffle_sections, seed
-                )
-                for ex, seed in zip(batch, seeds)
-            ]
-            return [f.result() for f in futures]
+    # Start prefetching batches from stream in background thread
+    batch_queue: Queue = Queue(maxsize=PREFETCH_BATCHES)
+    prefetch_thread = Thread(
+        target=prefetch_batches,
+        args=(ds, BATCH_SIZE, batch_queue, seed_rng, max_rows),
+        daemon=True,
+    )
+    prefetch_thread.start()
 
     # Process in shards
     texts = []
     shard_idx = 0
     total_processed = 0
+    total_serialized = 0
     first_text = None
     pending_uploads: list[Future] = []
-    batch = []
-    batch_seeds = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
 
-        # Use 2 upload workers to overlap processing with uploading
-        with ThreadPoolExecutor(max_workers=2) as upload_executor:
-            for example in tqdm(ds, total=max_rows, desc="Processing molecules"):
-                batch.append(example)
-                # Generate unique seed for each example if shuffling
-                batch_seeds.append(
-                    int(seed_rng.integers(0, 2**31)) if seed_rng is not None else None
-                )
+        with (
+            ProcessPoolExecutor(
+                max_workers=num_workers,
+                initializer=_init_worker,
+                initargs=(codebook_path, shuffle_sections),
+            ) as proc_executor,
+            ThreadPoolExecutor(max_workers=2) as upload_executor,
+        ):
+            with tqdm(total=max_rows, desc="Processing molecules") as pbar:
+                while True:
+                    # Get next batch from prefetch queue
+                    batch_data = batch_queue.get()
+                    if batch_data is None:
+                        break  # End of stream
 
-                # Process batch when full
-                if len(batch) >= BATCH_SIZE:
-                    batch_texts = process_batch(batch, batch_seeds)
+                    batch, batch_seeds, cumulative_count = batch_data
+
+                    # Process batch in parallel using process pool
+                    batch_texts = list(
+                        proc_executor.map(_serialize_in_worker, zip(batch, batch_seeds))
+                    )
                     texts.extend(batch_texts)
+                    total_serialized += len(batch_texts)
+
+                    # Update progress bar
+                    pbar.update(len(batch))
 
                     if first_text is None and batch_texts:
                         first_text = batch_texts[0]
-
-                    batch = []
-                    batch_seeds = []
 
                     # When shard is full, write and upload in background
                     while len(texts) >= shard_size:
@@ -226,13 +267,6 @@ def serialize_and_push(
                             pending_uploads.remove(f)
 
                         shard_idx += 1
-
-            # Process remaining batch
-            if batch:
-                batch_texts = process_batch(batch, batch_seeds)
-                texts.extend(batch_texts)
-                if first_text is None and batch_texts:
-                    first_text = batch_texts[0]
 
             # Upload remaining full shards
             while len(texts) >= shard_size:
@@ -267,6 +301,8 @@ def serialize_and_push(
                 tqdm.write(
                     f"  Uploaded {target_split} shard {idx} ({total_processed:,} molecules total)"
                 )
+
+    prefetch_thread.join()
 
     print(f"\nSuccessfully pushed {total_processed:,} molecules to '{target_split}' split in {shard_idx + 1} shards")
     print(f"Dataset URL: https://huggingface.co/datasets/{repo_id}")
