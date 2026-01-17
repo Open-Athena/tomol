@@ -1,4 +1,8 @@
-"""Serialize molecular dataset and push to HuggingFace Hub."""
+"""
+Serialize molecular dataset and push to HuggingFace Hub.
+
+Dataset downloaded locally with: uv run huggingface-cli download facebook/OMol25
+"""
 
 import argparse
 import random
