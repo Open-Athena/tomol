@@ -69,18 +69,16 @@ def _process_file(args: tuple) -> None:
 class ShardUploader:
     """Streams shards to HuggingFace when they reach target size."""
 
-    def __init__(self, api: HfApi, repo_id: str, target_bytes: int):
+    def __init__(self, api: HfApi, repo_id: str, shard_size: int):
         self.api = api
         self.repo_id = repo_id
-        self.target_bytes = target_bytes
+        self.shard_size = shard_size
         self.tmpdir = Path(tempfile.mkdtemp())
 
         self.train_buffer: list[str] = []
-        self.train_bytes = 0
         self.train_shard_idx = 0
 
         self.val_buffer: list[str] = []
-        self.val_bytes = 0
         self.val_shard_idx = 0
 
         self.upload_pool = ThreadPoolExecutor(4)
@@ -88,33 +86,33 @@ class ShardUploader:
 
     def add_train(self, texts: list[str]):
         self.train_buffer.extend(texts)
-        self.train_bytes += sum(len(t) for t in texts)
-        if self.train_bytes >= self.target_bytes:
+        print(f"[add_train] +{len(texts):,} -> buffer={len(self.train_buffer):,} (threshold={self.shard_size:,})")
+        while len(self.train_buffer) >= self.shard_size:
             self._flush_train()
 
     def add_val(self, texts: list[str]):
         self.val_buffer.extend(texts)
-        self.val_bytes += sum(len(t) for t in texts)
-        if self.val_bytes >= self.target_bytes:
+        print(f"[add_val] +{len(texts):,} -> buffer={len(self.val_buffer):,} (threshold={self.shard_size:,})")
+        while len(self.val_buffer) >= self.shard_size:
             self._flush_val()
 
     def _flush_train(self):
         if not self.train_buffer:
             return
-        shard, idx = self.train_buffer, self.train_shard_idx
-        self.train_buffer = []
-        self.train_bytes = 0
+        shard = self.train_buffer[:self.shard_size]
+        self.train_buffer = self.train_buffer[self.shard_size:]
+        print(f"Flushing train shard {self.train_shard_idx}: {len(shard):,} examples")
+        self.pending_uploads.append(self.upload_pool.submit(self._write_and_upload, shard, "train", self.train_shard_idx))
         self.train_shard_idx += 1
-        self.pending_uploads.append(self.upload_pool.submit(self._write_and_upload, shard, "train", idx))
 
     def _flush_val(self):
         if not self.val_buffer:
             return
-        shard, idx = self.val_buffer, self.val_shard_idx
-        self.val_buffer = []
-        self.val_bytes = 0
+        shard = self.val_buffer[:self.shard_size]
+        self.val_buffer = self.val_buffer[self.shard_size:]
+        print(f"Flushing val shard {self.val_shard_idx}: {len(shard):,} examples")
+        self.pending_uploads.append(self.upload_pool.submit(self._write_and_upload, shard, "validation", self.val_shard_idx))
         self.val_shard_idx += 1
-        self.pending_uploads.append(self.upload_pool.submit(self._write_and_upload, shard, "validation", idx))
 
     def _write_and_upload(self, texts: list[str], split: str, shard_idx: int):
         path = self.tmpdir / f"{split}-{shard_idx:05d}.parquet"
@@ -124,8 +122,12 @@ class ShardUploader:
 
     def finish(self):
         """Flush remaining data and wait for all uploads."""
-        self._flush_train()
-        self._flush_val()
+        if self.train_buffer:
+            print(f"Flushing final train shard {self.train_shard_idx}: {len(self.train_buffer):,} examples")
+            self.pending_uploads.append(self.upload_pool.submit(self._write_and_upload, self.train_buffer, "train", self.train_shard_idx))
+        if self.val_buffer:
+            print(f"Flushing final val shard {self.val_shard_idx}: {len(self.val_buffer):,} examples")
+            self.pending_uploads.append(self.upload_pool.submit(self._write_and_upload, self.val_buffer, "validation", self.val_shard_idx))
         for f in tqdm(as_completed(self.pending_uploads), total=len(self.pending_uploads), desc="Uploading"):
             f.result()
         self.upload_pool.shutdown()
@@ -138,7 +140,7 @@ def main():
     parser.add_argument("repo_id")
     parser.add_argument("--codebook", "-c", default="codebook_mol_1m.pkl")
     parser.add_argument("--val-size", "-v", type=int, default=100_000)
-    parser.add_argument("--shard-mb", type=int, default=500, help="Target shard size in MB")
+    parser.add_argument("--shard-size", type=int, default=250_000, help="Records per shard")
     parser.add_argument("--num-workers", "-j", type=int, default=16)
     parser.add_argument("--seed", "-s", type=int, default=42)
     args = parser.parse_args()
@@ -163,7 +165,7 @@ def main():
     # Setup uploader
     api = HfApi()
     api.create_repo(args.repo_id, repo_type="dataset", exist_ok=True)
-    uploader = ShardUploader(api, args.repo_id, target_bytes=args.shard_mb * 1024 * 1024)
+    uploader = ShardUploader(api, args.repo_id, shard_size=args.shard_size)
 
     # Process files in parallel, streaming batch results via queue
     tasks = [(f, off, val_indices) for f, off in zip(files, offsets)]
