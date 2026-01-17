@@ -76,6 +76,40 @@ def load_codebook(path: str) -> dict:
         return pickle.load(f)
 
 
+def decode_positions(codes: np.ndarray, codebooks: list[np.ndarray]) -> np.ndarray:
+    """
+    Decode positions from RVQ codes.
+
+    Args:
+        codes: (N, L) array of codebook indices
+        codebooks: List of L codebooks, each (K, 3)
+
+    Returns:
+        positions: (N, 3) reconstructed position vectors
+    """
+    positions = np.zeros((len(codes), 3))
+    for level, codebook in enumerate(codebooks):
+        positions += codebook[codes[:, level]]
+    return positions
+
+
+def decode_1d(codes: np.ndarray, codebooks: list[np.ndarray]) -> np.ndarray:
+    """
+    Decode 1D values from RVQ codes.
+
+    Args:
+        codes: (N, L) array of codebook indices
+        codebooks: List of L codebooks, each (K,)
+
+    Returns:
+        values: (N,) reconstructed scalar values
+    """
+    values = np.zeros(len(codes))
+    for level, codebook in enumerate(codebooks):
+        values += codebook[codes[:, level]]
+    return values
+
+
 def encode_positions(positions: np.ndarray, codebooks: list[np.ndarray]) -> np.ndarray:
     """
     Encode positions using RVQ codebooks.
@@ -379,6 +413,137 @@ class MoleculeTokenizer:
             lookup[tok] if 0 <= tok < vocab_size else f"[UNK:{tok}]"
             for tok in tokens
         )
+
+    def decode_molecule(self, tokens: list[int]) -> dict:
+        """
+        Decode token sequence back to molecular data.
+
+        Args:
+            tokens: List of token IDs
+
+        Returns:
+            Dictionary with:
+                - atomic_numbers: list of atomic numbers
+                - positions: (N, 3) array (centered, scaled back to original units)
+                - forces: (N, 3) array (scaled back to original units)
+                - energy: scalar (shifted and scaled back to original units)
+        """
+        K = self.K
+
+        # Parse token sequence into sections
+        atomic_numbers = []
+        pos_codes = []
+        force_x_codes = []
+        force_y_codes = []
+        force_z_codes = []
+        energy_codes = []
+
+        current_section = None
+        current_atom_pos = []
+        current_atom_fx = []
+        current_atom_fy = []
+        current_atom_fz = []
+
+        for tid in tokens:
+            # Check for section markers
+            if tid == SPECIAL_TOKENS["[BOS]"] or tid == SPECIAL_TOKENS["[EOS]"]:
+                continue
+            elif tid == SPECIAL_TOKENS["[ATOMS]"]:
+                current_section = "atoms"
+                continue
+            elif tid == SPECIAL_TOKENS["[ATOMS_END]"]:
+                current_section = None
+                continue
+            elif tid == SPECIAL_TOKENS["[POS]"]:
+                current_section = "pos"
+                current_atom_pos = []
+                continue
+            elif tid == SPECIAL_TOKENS["[POS_END]"]:
+                current_section = None
+                continue
+            elif tid == SPECIAL_TOKENS["[FORCE]"]:
+                current_section = "force"
+                current_atom_fx = []
+                current_atom_fy = []
+                current_atom_fz = []
+                continue
+            elif tid == SPECIAL_TOKENS["[FORCE_END]"]:
+                current_section = None
+                continue
+            elif tid == SPECIAL_TOKENS["[ENERGY]"]:
+                current_section = "energy"
+                continue
+            elif tid == SPECIAL_TOKENS["[ENERGY_END]"]:
+                current_section = None
+                continue
+            elif tid == SPECIAL_TOKENS["\n"]:
+                # Newline marks end of atom's data
+                if current_section == "pos" and current_atom_pos:
+                    pos_codes.append(current_atom_pos)
+                    current_atom_pos = []
+                elif current_section == "force" and current_atom_fx:
+                    force_x_codes.append(current_atom_fx)
+                    force_y_codes.append(current_atom_fy)
+                    force_z_codes.append(current_atom_fz)
+                    current_atom_fx = []
+                    current_atom_fy = []
+                    current_atom_fz = []
+                continue
+
+            # Parse based on current section
+            if current_section == "atoms":
+                atomic_num = tid - ATOM_TOKEN_OFFSET + 1
+                atomic_numbers.append(atomic_num)
+
+            elif current_section == "pos":
+                offset = tid - self.pos_token_start
+                code = offset % K
+                current_atom_pos.append(code)
+
+            elif current_section == "force":
+                if tid >= self.force_z_token_start:
+                    offset = tid - self.force_z_token_start
+                    code = offset % K
+                    current_atom_fz.append(code)
+                elif tid >= self.force_y_token_start:
+                    offset = tid - self.force_y_token_start
+                    code = offset % K
+                    current_atom_fy.append(code)
+                elif tid >= self.force_x_token_start:
+                    offset = tid - self.force_x_token_start
+                    code = offset % K
+                    current_atom_fx.append(code)
+
+            elif current_section == "energy":
+                offset = tid - self.energy_token_start
+                code = offset % K
+                energy_codes.append(code)
+
+        # Convert to arrays
+        pos_codes_arr = np.array(pos_codes, dtype=np.int32)
+        fx_codes_arr = np.array(force_x_codes, dtype=np.int32)
+        fy_codes_arr = np.array(force_y_codes, dtype=np.int32)
+        fz_codes_arr = np.array(force_z_codes, dtype=np.int32)
+        energy_codes_arr = np.array(energy_codes, dtype=np.int32)
+
+        # Decode using codebooks
+        positions = decode_positions(pos_codes_arr, self.pos_codebooks)
+        positions = positions * self.preprocessing["position_scale"]
+
+        fx = decode_1d(fx_codes_arr, self.force_codebooks["x"])
+        fy = decode_1d(fy_codes_arr, self.force_codebooks["y"])
+        fz = decode_1d(fz_codes_arr, self.force_codebooks["z"])
+        forces = np.stack([fx, fy, fz], axis=1) * self.preprocessing["force_scale"]
+
+        energy = decode_1d(energy_codes_arr[np.newaxis, :], self.energy_codebooks)[0]
+        energy = energy * self.preprocessing["energy_scale"] + self.preprocessing["energy_shift"]
+
+        return {
+            "atomic_numbers": atomic_numbers,
+            "positions": positions,
+            "forces": forces,
+            "energy": energy,
+        }
 
     def build_vocab(self) -> dict[str, int]:
         """
