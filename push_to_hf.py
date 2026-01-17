@@ -27,23 +27,27 @@ def _init_worker(codebook_path: str):
 
 
 def _process_file(args: tuple) -> tuple[list[str], list[str]]:
-    """Process one parquet file, return (train_texts, val_texts)."""
+    """Process one parquet file in batches, return (train_texts, val_texts)."""
     path, start_idx, val_indices = args
-    table = pq.read_table(path, columns=["atomic_numbers", "positions", "atomic_forces", "energy"])
+    pf = pq.ParquetFile(path)
 
     train, val = [], []
-    for i, row in enumerate(table.to_pylist()):
-        tokens = _tokenizer.encode_molecule(
-            row["atomic_numbers"],
-            np.array(row["positions"]),
-            np.array(row["atomic_forces"]),
-            float(row["energy"]),
-        )
-        text = _tokenizer.tokens_to_string(tokens)
-        if (start_idx + i) in val_indices:
-            val.append(text)
-        else:
-            train.append(text)
+    row_idx = start_idx
+
+    for batch in pf.iter_batches(batch_size=1024, columns=["atomic_numbers", "positions", "atomic_forces", "energy"]):
+        for row in batch.to_pylist():
+            tokens = _tokenizer.encode_molecule(
+                row["atomic_numbers"],
+                np.array(row["positions"]),
+                np.array(row["atomic_forces"]),
+                float(row["energy"]),
+            )
+            text = _tokenizer.tokens_to_string(tokens)
+            if row_idx in val_indices:
+                val.append(text)
+            else:
+                train.append(text)
+            row_idx += 1
     return train, val
 
 
