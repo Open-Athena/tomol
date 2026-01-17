@@ -36,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.spatial.distance import cdist
 from tqdm import tqdm
 
 
@@ -92,7 +93,8 @@ def encode_positions(positions: np.ndarray, codebooks: list[np.ndarray]) -> np.n
     residuals = positions.copy()
 
     for level, codebook in enumerate(codebooks):
-        dists = np.linalg.norm(residuals[:, None, :] - codebook[None, :, :], axis=2)
+        # Use squared euclidean (faster, argmin is the same)
+        dists = cdist(residuals, codebook, metric="sqeuclidean")
         codes[:, level] = np.argmin(dists, axis=1)
         residuals = residuals - codebook[codes[:, level]]
 
@@ -194,6 +196,40 @@ class MoleculeTokenizer:
         self.energy_token_start = self.force_z_token_start + self.n_levels * self.K
 
         self.vocab_size = self.energy_token_start + self.n_levels * self.K
+
+        # Precompute token ID -> string lookup table for fast serialization
+        self._token_strings: list[str] = self._build_token_lookup()
+
+    def _build_token_lookup(self) -> list[str]:
+        """Build lookup table mapping token ID -> string representation."""
+        lookup = [""] * self.vocab_size
+
+        # Special tokens
+        for name, tid in SPECIAL_TOKENS.items():
+            lookup[tid] = "[NL]" if name == "\n" else name
+
+        # Atom tokens
+        for z in range(1, MAX_ATOMIC_NUMBER + 1):
+            lookup[ATOM_TOKEN_OFFSET + z - 1] = f"[Z={z}]"
+
+        # Position tokens
+        for level in range(self.pos_levels):
+            for code in range(self.K):
+                lookup[self.pos_token_start + level * self.K + code] = f"[P{level}:{code}]"
+
+        # Force X/Y/Z tokens
+        for level in range(self.n_levels):
+            for code in range(self.K):
+                lookup[self.force_x_token_start + level * self.K + code] = f"[FX{level}:{code}]"
+                lookup[self.force_y_token_start + level * self.K + code] = f"[FY{level}:{code}]"
+                lookup[self.force_z_token_start + level * self.K + code] = f"[FZ{level}:{code}]"
+
+        # Energy tokens
+        for level in range(self.n_levels):
+            for code in range(self.K):
+                lookup[self.energy_token_start + level * self.K + code] = f"[E{level}:{code}]"
+
+        return lookup
 
     def get_vocab_info(self) -> dict:
         """Return vocabulary information."""
@@ -324,52 +360,25 @@ class MoleculeTokenizer:
         Returns:
             String representation of tokens
         """
-        parts = []
-        for tok in tokens:
-            # Check special tokens first
-            special_found = False
-            for name, tid in SPECIAL_TOKENS.items():
-                if tok == tid:
-                    if name == "\n":
-                        # Use [NL] for tokenizer compatibility, or actual newline for display
-                        parts.append("\n" if pretty else "[NL]")
-                    else:
-                        parts.append(name)
-                    special_found = True
-                    break
-            if special_found:
-                continue
-            if ATOM_TOKEN_OFFSET <= tok < CODEBOOK_TOKEN_OFFSET:
-                atomic_num = tok - ATOM_TOKEN_OFFSET + 1
-                parts.append(f"[Z={atomic_num}]")
-            elif self.pos_token_start <= tok < self.force_x_token_start:
-                rel = tok - self.pos_token_start
-                level = rel // self.K
-                code = rel % self.K
-                parts.append(f"[P{level}:{code}]")
-            elif self.force_x_token_start <= tok < self.force_y_token_start:
-                rel = tok - self.force_x_token_start
-                level = rel // self.K
-                code = rel % self.K
-                parts.append(f"[FX{level}:{code}]")
-            elif self.force_y_token_start <= tok < self.force_z_token_start:
-                rel = tok - self.force_y_token_start
-                level = rel // self.K
-                code = rel % self.K
-                parts.append(f"[FY{level}:{code}]")
-            elif self.force_z_token_start <= tok < self.energy_token_start:
-                rel = tok - self.force_z_token_start
-                level = rel // self.K
-                code = rel % self.K
-                parts.append(f"[FZ{level}:{code}]")
-            elif self.energy_token_start <= tok < self.vocab_size:
-                rel = tok - self.energy_token_start
-                level = rel // self.K
-                code = rel % self.K
-                parts.append(f"[E{level}:{code}]")
-            else:
-                parts.append(f"[UNK:{tok}]")
-        return " ".join(parts)
+        lookup = self._token_strings
+        vocab_size = self.vocab_size
+
+        if pretty:
+            # Slower path: replace [NL] with actual newlines
+            parts = []
+            for tok in tokens:
+                if 0 <= tok < vocab_size:
+                    s = lookup[tok]
+                    parts.append("\n" if s == "[NL]" else s)
+                else:
+                    parts.append(f"[UNK:{tok}]")
+            return " ".join(parts)
+
+        # Fast path: direct lookup
+        return " ".join(
+            lookup[tok] if 0 <= tok < vocab_size else f"[UNK:{tok}]"
+            for tok in tokens
+        )
 
     def build_vocab(self) -> dict[str, int]:
         """

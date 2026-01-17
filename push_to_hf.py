@@ -147,14 +147,26 @@ def serialize_and_push(
 
     print(f"\nLoading dataset from {source_dataset} (split={source_split})...")
 
-    # Load dataset in streaming mode
+    # Load dataset - check if local path or HuggingFace dataset
     datasets.disable_caching()
-    ds = load_dataset(
-        source_dataset,
-        revision=source_revision,
-        split=source_split,
-        streaming=True,
-    )
+    source_path = Path(source_dataset)
+    if source_path.exists():
+        # Local file or directory
+        if source_path.is_file():
+            ds = load_dataset("parquet", data_files=str(source_path), split="train")
+        else:
+            # Directory of parquet files
+            ds = load_dataset("parquet", data_dir=str(source_path), split="train")
+        print(f"Loaded local dataset with {len(ds):,} rows")
+        ds = ds.to_iterable_dataset()
+    else:
+        # HuggingFace dataset - use streaming
+        ds = load_dataset(
+            source_dataset,
+            revision=source_revision,
+            split=source_split,
+            streaming=True,
+        )
 
     # Select only the columns we need
     ds = ds.select_columns(["atomic_numbers", "positions", "atomic_forces", "energy"])
