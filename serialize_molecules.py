@@ -5,7 +5,7 @@ Sequence format with shuffleable sections:
 
 [BOS]
 [ATOMS]
-  [Z=6] \n [Z=6] \n [Z=1] \n ...   # atom types with newline after each
+  [Z=6] [Z=6] [Z=1] ...            # atom types (no separators)
 [ATOMS_END]
 [POS]
   [P0] [P1] ... [P7] \n            # position tokens for atom 0
@@ -264,11 +264,10 @@ class MoleculeTokenizer:
         # Build each section
         NL = SPECIAL_TOKENS["\n"]
 
-        # [ATOMS] section: atom types with newline after each
+        # [ATOMS] section: atom types (no newlines needed - single token per atom)
         atoms_section = [SPECIAL_TOKENS["[ATOMS]"]]
         for atomic_num in atomic_numbers:
             atoms_section.append(ATOM_TOKEN_OFFSET + atomic_num - 1)
-            atoms_section.append(NL)
         atoms_section.append(SPECIAL_TOKENS["[ATOMS_END]"])
 
         # [POS] section: position codes with newline after each atom's position
