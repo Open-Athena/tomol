@@ -11,6 +11,7 @@ This script:
 import argparse
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 
 import datasets
@@ -127,59 +128,71 @@ def serialize_and_push(
     print(f"\nStreaming and pushing to HuggingFace Hub: {repo_id} (split: {target_split})")
     print(f"Shard size: {shard_size:,} molecules (~{shard_size * 3 // 1000} MB per shard)")
 
+    def upload_shard(shard_path: Path, shard_idx: int, count: int) -> tuple[int, int]:
+        """Upload a shard and return (shard_idx, count) on success."""
+        api.upload_file(
+            path_or_fileobj=str(shard_path),
+            path_in_repo=f"data/{target_split}-{shard_idx:05d}.parquet",
+            repo_id=repo_id,
+            repo_type="dataset",
+        )
+        shard_path.unlink()
+        return shard_idx, count
+
     # Process in shards
     texts = []
     shard_idx = 0
     total_processed = 0
     first_text = None
+    pending_uploads: list[Future] = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
 
-        for example in tqdm(ds, total=max_rows, desc="Processing molecules"):
-            text = serialize_example(example, tokenizer, shuffle_sections, rng)
-            texts.append(text)
+        # Use 2 upload workers to overlap processing with uploading
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            for example in tqdm(ds, total=max_rows, desc="Processing molecules"):
+                text = serialize_example(example, tokenizer, shuffle_sections, rng)
+                texts.append(text)
 
-            if first_text is None:
-                first_text = text
+                if first_text is None:
+                    first_text = text
 
-            # When shard is full, write and upload
-            if len(texts) >= shard_size:
+                # When shard is full, write and upload in background
+                if len(texts) >= shard_size:
+                    shard_path = tmpdir / f"{target_split}-{shard_idx:05d}.parquet"
+                    shard_dataset = Dataset.from_dict({"text": texts})
+                    shard_dataset.to_parquet(shard_path)
+
+                    # Submit upload to background thread
+                    future = executor.submit(upload_shard, shard_path, shard_idx, len(texts))
+                    pending_uploads.append(future)
+
+                    # Check for completed uploads and report progress
+                    done = [f for f in pending_uploads if f.done()]
+                    for f in done:
+                        idx, count = f.result()
+                        total_processed += count
+                        tqdm.write(f"  Uploaded {target_split} shard {idx} ({total_processed:,} molecules total)")
+                        pending_uploads.remove(f)
+
+                    texts = []
+                    shard_idx += 1
+
+            # Upload final partial shard if any
+            if texts:
                 shard_path = tmpdir / f"{target_split}-{shard_idx:05d}.parquet"
                 shard_dataset = Dataset.from_dict({"text": texts})
                 shard_dataset.to_parquet(shard_path)
 
-                # Upload shard
-                api.upload_file(
-                    path_or_fileobj=str(shard_path),
-                    path_in_repo=f"data/{target_split}-{shard_idx:05d}.parquet",
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                )
+                future = executor.submit(upload_shard, shard_path, shard_idx, len(texts))
+                pending_uploads.append(future)
 
-                total_processed += len(texts)
-                tqdm.write(f"  Uploaded {target_split} shard {shard_idx} ({total_processed:,} molecules total)")
-
-                # Clear memory
-                shard_path.unlink()
-                texts = []
-                shard_idx += 1
-
-        # Upload final partial shard if any
-        if texts:
-            shard_path = tmpdir / f"{target_split}-{shard_idx:05d}.parquet"
-            shard_dataset = Dataset.from_dict({"text": texts})
-            shard_dataset.to_parquet(shard_path)
-
-            api.upload_file(
-                path_or_fileobj=str(shard_path),
-                path_in_repo=f"data/{target_split}-{shard_idx:05d}.parquet",
-                repo_id=repo_id,
-                repo_type="dataset",
-            )
-
-            total_processed += len(texts)
-            tqdm.write(f"  Uploaded {target_split} shard {shard_idx} ({total_processed:,} molecules total)")
+            # Wait for all pending uploads to complete
+            for future in pending_uploads:
+                idx, count = future.result()
+                total_processed += count
+                tqdm.write(f"  Uploaded {target_split} shard {idx} ({total_processed:,} molecules total)")
 
     print(f"\nSuccessfully pushed {total_processed:,} molecules to '{target_split}' split in {shard_idx + 1} shards")
     print(f"Dataset URL: https://huggingface.co/datasets/{repo_id}")
