@@ -25,23 +25,42 @@ from serialize_molecules import MoleculeTokenizer
 _tokenizer: MoleculeTokenizer | None = None
 _counter = None
 _result_queue = None
+_tmpdir = None
+_batch_counter = None
+_disk_batch_size = None
 
 
-def _init_worker(codebook_path: str, counter: mp.Value, result_queue: mp.Queue):
-    global _tokenizer, _counter, _result_queue
+def _init_worker(codebook_path: str, counter: mp.Value, result_queue: mp.Queue, tmpdir: str, batch_counter: mp.Value, disk_batch_size: int):
+    global _tokenizer, _counter, _result_queue, _tmpdir, _batch_counter, _disk_batch_size
     _tokenizer = MoleculeTokenizer(codebook_path)
     _counter = counter
     _result_queue = result_queue
+    _tmpdir = Path(tmpdir)
+    _batch_counter = batch_counter
+    _disk_batch_size = disk_batch_size
+
+
+def _flush_to_disk(train: list[str], val: list[str]) -> None:
+    """Write accumulated batch to temp file and queue the path."""
+    with _batch_counter.get_lock():
+        batch_id = _batch_counter.value
+        _batch_counter.value += 1
+
+    batch_file = _tmpdir / f"batch_{batch_id:08d}.parquet"
+    pq.write_table(pa.table({"train": [train], "val": [val]}), batch_file)
+    _result_queue.put(str(batch_file))
 
 
 def _process_file(args: tuple) -> None:
-    """Process one parquet file in batches, streaming results to queue."""
+    """Process one parquet file in batches, writing results to temp files."""
     path, start_idx, val_indices = args
     pf = pq.ParquetFile(path)
     row_idx = start_idx
 
+    # Accumulate until disk_batch_size before writing to disk
+    train_accum, val_accum = [], []
+
     for batch in pf.iter_batches(batch_size=1024, columns=["atomic_numbers", "positions", "atomic_forces", "energy"]):
-        train, val = [], []
         batch_list = batch.to_pylist()
         for row in batch_list:
             tokens = _tokenizer.encode_molecule(
@@ -52,16 +71,22 @@ def _process_file(args: tuple) -> None:
             )
             text = _tokenizer.tokens_to_string(tokens)
             if row_idx in val_indices:
-                val.append(text)
+                val_accum.append(text)
             else:
-                train.append(text)
+                train_accum.append(text)
             row_idx += 1
-
-        # Stream batch results to queue
-        _result_queue.put((train, val))
 
         with _counter.get_lock():
             _counter.value += len(batch_list)
+
+        # Flush to disk when accumulated enough
+        if len(train_accum) + len(val_accum) >= _disk_batch_size:
+            _flush_to_disk(train_accum, val_accum)
+            train_accum, val_accum = [], []
+
+    # Flush remaining
+    if train_accum or val_accum:
+        _flush_to_disk(train_accum, val_accum)
 
     # Signal this file is done
     _result_queue.put(None)
@@ -74,7 +99,7 @@ class ShardUploader:
         self.api = api
         self.repo_id = repo_id
         self.shard_size = shard_size
-        self.tmpdir = Path(tempfile.mkdtemp())
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="shard_upload_", dir="."))
 
         self.train_buffer: list[str] = []
         self.train_shard_idx = 0
@@ -112,7 +137,26 @@ class ShardUploader:
         self._write_and_upload(shard, "validation", self.val_shard_idx)
         self.val_shard_idx += 1
 
+    def _cleanup_completed_uploads(self):
+        """Remove completed uploads from pending list and delete their temp files."""
+        still_pending = []
+        for future, path, name in self.pending_uploads:
+            if future.done():
+                try:
+                    future.result()  # Raise if failed
+                    tqdm.write(f"[upload] Done {name}.parquet")
+                except Exception as e:
+                    tqdm.write(f"[upload] FAILED {name}.parquet: {e}")
+                    raise
+                path.unlink(missing_ok=True)
+            else:
+                still_pending.append((future, path, name))
+        self.pending_uploads = still_pending
+
     def _write_and_upload(self, texts: list[str], split: str, shard_idx: int):
+        # Clean up any completed uploads first
+        self._cleanup_completed_uploads()
+
         path = self.tmpdir / f"{split}-{shard_idx:05d}.parquet"
         tqdm.write(f"[upload] Writing {split}-{shard_idx:05d}.parquet ({len(texts):,} rows)...")
         pq.write_table(pa.table({"text": texts}), path)
@@ -152,6 +196,7 @@ def main():
     parser.add_argument("--codebook", "-c", default="codebook_mol_1m.pkl")
     parser.add_argument("--val-size", "-v", type=int, default=100_000)
     parser.add_argument("--shard-size", type=int, default=250_000, help="Records per shard")
+    parser.add_argument("--disk-batch-size", type=int, default=50_000, help="Records per temp file")
     parser.add_argument("--num-workers", "-j", type=int, default=16)
     parser.add_argument("--seed", "-s", type=int, default=42)
     args = parser.parse_args()
@@ -179,12 +224,20 @@ def main():
     api.create_repo(args.repo_id, repo_type="dataset", exist_ok=True)
     uploader = ShardUploader(api, args.repo_id, shard_size=args.shard_size)
 
-    # Process files in parallel, streaming batch results via queue
+    # Process files in parallel, streaming batch results via temp files
     tasks = [(f, off, val_indices) for f, off in zip(files, offsets)]
     counter = mp.Value("q", 0)
+    batch_counter = mp.Value("q", 0)
     result_queue = mp.Queue()
 
-    pool = mp.Pool(args.num_workers, initializer=_init_worker, initargs=(args.codebook, counter, result_queue))
+    # Temp directory for batch files (separate from uploader's tmpdir)
+    batch_tmpdir = tempfile.mkdtemp(prefix="batch_", dir=".")
+
+    pool = mp.Pool(
+        args.num_workers,
+        initializer=_init_worker,
+        initargs=(args.codebook, counter, result_queue, batch_tmpdir, batch_counter, args.disk_batch_size),
+    )
     pool.map_async(_process_file, tasks)
 
     pbar = tqdm(total=total, desc="Processing", unit="mol")
@@ -199,7 +252,13 @@ def main():
             if result is None:
                 files_done += 1
             else:
-                train, val = result
+                # Result is a path to a temp parquet file
+                batch_path = Path(result)
+                table = pq.read_table(batch_path)
+                train = table["train"][0].as_py()
+                val = table["val"][0].as_py()
+                batch_path.unlink()  # Delete immediately after reading
+
                 uploader.add_train(train)
                 uploader.add_val(val)
         except Empty:
@@ -209,6 +268,9 @@ def main():
     pbar.close()
     pool.close()
     pool.join()
+
+    # Clean up batch tmpdir
+    shutil.rmtree(batch_tmpdir, ignore_errors=True)
 
     # Flush remaining and wait for uploads
     uploader.finish()
