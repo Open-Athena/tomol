@@ -21,7 +21,7 @@ from tqdm import tqdm
 from serialize_molecules import MoleculeTokenizer
 
 _tokenizer: MoleculeTokenizer | None = None
-_counter: mp.Value | None = None
+_counter = None
 
 
 def _init_worker(codebook_path: str, counter: mp.Value):
