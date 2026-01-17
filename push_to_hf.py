@@ -9,9 +9,9 @@ import multiprocessing as mp
 import random
 import shutil
 import tempfile
-import time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from queue import Empty
 
 import numpy as np
 import pyarrow as pa
@@ -23,23 +23,24 @@ from serialize_molecules import MoleculeTokenizer
 
 _tokenizer: MoleculeTokenizer | None = None
 _counter = None
+_result_queue = None
 
 
-def _init_worker(codebook_path: str, counter: mp.Value):
-    global _tokenizer, _counter
+def _init_worker(codebook_path: str, counter: mp.Value, result_queue: mp.Queue):
+    global _tokenizer, _counter, _result_queue
     _tokenizer = MoleculeTokenizer(codebook_path)
     _counter = counter
+    _result_queue = result_queue
 
 
-def _process_file(args: tuple) -> tuple[list[str], list[str]]:
-    """Process one parquet file in batches, return (train_texts, val_texts)."""
+def _process_file(args: tuple) -> None:
+    """Process one parquet file in batches, streaming results to queue."""
     path, start_idx, val_indices = args
     pf = pq.ParquetFile(path)
-
-    train, val = [], []
     row_idx = start_idx
 
     for batch in pf.iter_batches(batch_size=1024, columns=["atomic_numbers", "positions", "atomic_forces", "energy"]):
+        train, val = [], []
         batch_list = batch.to_pylist()
         for row in batch_list:
             tokens = _tokenizer.encode_molecule(
@@ -54,9 +55,15 @@ def _process_file(args: tuple) -> tuple[list[str], list[str]]:
             else:
                 train.append(text)
             row_idx += 1
+
+        # Stream batch results to queue
+        _result_queue.put((train, val))
+
         with _counter.get_lock():
             _counter.value += len(batch_list)
-    return train, val
+
+    # Signal this file is done
+    _result_queue.put(None)
 
 
 class ShardUploader:
@@ -158,32 +165,36 @@ def main():
     api.create_repo(args.repo_id, repo_type="dataset", exist_ok=True)
     uploader = ShardUploader(api, args.repo_id, target_bytes=args.shard_mb * 1024 * 1024)
 
-    # Process files in parallel, streaming results to uploader as they complete
+    # Process files in parallel, streaming batch results via queue
     tasks = [(f, off, val_indices) for f, off in zip(files, offsets)]
     counter = mp.Value("q", 0)
+    result_queue = mp.Queue()
 
-    with ProcessPoolExecutor(args.num_workers, initializer=_init_worker, initargs=(args.codebook, counter)) as pool:
-        futures = [pool.submit(_process_file, t) for t in tasks]
-        pbar = tqdm(total=total, desc="Processing", unit="mol")
-        pending = set(futures)
+    pool = mp.Pool(args.num_workers, initializer=_init_worker, initargs=(args.codebook, counter, result_queue))
+    pool.map_async(_process_file, tasks)
 
-        while pending:
-            pbar.n = counter.value
-            pbar.refresh()
+    pbar = tqdm(total=total, desc="Processing", unit="mol")
+    files_done = 0
 
-            # Stream completed results to uploader (frees memory)
-            done = {f for f in pending if f.done()}
-            for future in done:
-                train, val = future.result()
+    while files_done < len(files):
+        pbar.n = counter.value
+        pbar.refresh()
+
+        try:
+            result = result_queue.get(timeout=0.1)
+            if result is None:
+                files_done += 1
+            else:
+                train, val = result
                 uploader.add_train(train)
                 uploader.add_val(val)
-            pending -= done
+        except Empty:
+            pass
 
-            if pending:
-                time.sleep(0.1)
-
-        pbar.n = counter.value
-        pbar.close()
+    pbar.n = counter.value
+    pbar.close()
+    pool.close()
+    pool.join()
 
     # Flush remaining and wait for uploads
     uploader.finish()
