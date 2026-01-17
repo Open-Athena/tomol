@@ -23,6 +23,8 @@ from tqdm import tqdm
 from serialize_molecules import MoleculeTokenizer
 
 DEFAULT_SHARD_SIZE = 100_000
+DEFAULT_NUM_WORKERS = 16
+BATCH_SIZE = 256  # Number of examples to batch before parallel processing
 
 
 def serialize_example(
@@ -48,6 +50,17 @@ def serialize_example(
     return tokenizer.tokens_to_string(tokens)
 
 
+def serialize_example_with_seed(
+    example: dict,
+    tokenizer: MoleculeTokenizer,
+    shuffle_sections: bool,
+    seed: int | None,
+) -> str:
+    """Serialize a single molecule example with its own RNG seed (thread-safe)."""
+    rng = np.random.default_rng(seed) if shuffle_sections and seed is not None else None
+    return serialize_example(example, tokenizer, shuffle_sections, rng)
+
+
 def serialize_and_push(
     source_dataset: str,
     codebook_path: str,
@@ -61,6 +74,7 @@ def serialize_and_push(
     shuffle_seed: int = 42,
     private: bool = False,
     shard_size: int = DEFAULT_SHARD_SIZE,
+    num_workers: int = DEFAULT_NUM_WORKERS,
 ):
     """
     Stream a HuggingFace dataset, serialize molecules, and push to HuggingFace Hub.
@@ -80,6 +94,7 @@ def serialize_and_push(
         shuffle_seed: Random seed for section shuffling
         private: Whether to create a private repository
         shard_size: Number of examples per shard (default: 100k)
+        num_workers: Number of parallel workers for serialization (default: 16)
     """
     # Set up HF token
     token = get_token()
@@ -118,8 +133,8 @@ def serialize_and_push(
         ds = ds.take(max_rows)
         print(f"Processing up to {max_rows:,} molecules")
 
-    # Set up RNG for section shuffling
-    rng = np.random.default_rng(shuffle_seed) if shuffle_sections else None
+    # Set up seed generator for thread-safe RNG (each example gets unique seed)
+    seed_rng = np.random.default_rng(shuffle_seed) if shuffle_sections else None
 
     # Create or get the repository
     api = HfApi()
@@ -127,6 +142,7 @@ def serialize_and_push(
 
     print(f"\nStreaming and pushing to HuggingFace Hub: {repo_id} (split: {target_split})")
     print(f"Shard size: {shard_size:,} molecules (~{shard_size * 3 // 1000} MB per shard)")
+    print(f"Using {num_workers} workers for parallel serialization")
 
     def upload_shard(shard_path: Path, shard_idx: int, count: int) -> tuple[int, int]:
         """Upload a shard and return (shard_idx, count) on success."""
@@ -139,45 +155,99 @@ def serialize_and_push(
         shard_path.unlink()
         return shard_idx, count
 
+    def process_batch(
+        batch: list[dict], seeds: list[int | None]
+    ) -> list[str]:
+        """Process a batch of examples in parallel."""
+        with ThreadPoolExecutor(max_workers=num_workers) as proc_executor:
+            futures = [
+                proc_executor.submit(
+                    serialize_example_with_seed, ex, tokenizer, shuffle_sections, seed
+                )
+                for ex, seed in zip(batch, seeds)
+            ]
+            return [f.result() for f in futures]
+
     # Process in shards
     texts = []
     shard_idx = 0
     total_processed = 0
     first_text = None
     pending_uploads: list[Future] = []
+    batch = []
+    batch_seeds = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
 
         # Use 2 upload workers to overlap processing with uploading
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=2) as upload_executor:
             for example in tqdm(ds, total=max_rows, desc="Processing molecules"):
-                text = serialize_example(example, tokenizer, shuffle_sections, rng)
-                texts.append(text)
+                batch.append(example)
+                # Generate unique seed for each example if shuffling
+                batch_seeds.append(
+                    int(seed_rng.integers(0, 2**31)) if seed_rng is not None else None
+                )
 
-                if first_text is None:
-                    first_text = text
+                # Process batch when full
+                if len(batch) >= BATCH_SIZE:
+                    batch_texts = process_batch(batch, batch_seeds)
+                    texts.extend(batch_texts)
 
-                # When shard is full, write and upload in background
-                if len(texts) >= shard_size:
-                    shard_path = tmpdir / f"{target_split}-{shard_idx:05d}.parquet"
-                    shard_dataset = Dataset.from_dict({"text": texts})
-                    shard_dataset.to_parquet(shard_path)
+                    if first_text is None and batch_texts:
+                        first_text = batch_texts[0]
 
-                    # Submit upload to background thread
-                    future = executor.submit(upload_shard, shard_path, shard_idx, len(texts))
-                    pending_uploads.append(future)
+                    batch = []
+                    batch_seeds = []
 
-                    # Check for completed uploads and report progress
-                    done = [f for f in pending_uploads if f.done()]
-                    for f in done:
-                        idx, count = f.result()
-                        total_processed += count
-                        tqdm.write(f"  Uploaded {target_split} shard {idx} ({total_processed:,} molecules total)")
-                        pending_uploads.remove(f)
+                    # When shard is full, write and upload in background
+                    while len(texts) >= shard_size:
+                        shard_texts = texts[:shard_size]
+                        texts = texts[shard_size:]
 
-                    texts = []
-                    shard_idx += 1
+                        shard_path = tmpdir / f"{target_split}-{shard_idx:05d}.parquet"
+                        shard_dataset = Dataset.from_dict({"text": shard_texts})
+                        shard_dataset.to_parquet(shard_path)
+
+                        # Submit upload to background thread
+                        future = upload_executor.submit(
+                            upload_shard, shard_path, shard_idx, len(shard_texts)
+                        )
+                        pending_uploads.append(future)
+
+                        # Check for completed uploads and report progress
+                        done = [f for f in pending_uploads if f.done()]
+                        for f in done:
+                            idx, count = f.result()
+                            total_processed += count
+                            tqdm.write(
+                                f"  Uploaded {target_split} shard {idx} ({total_processed:,} molecules total)"
+                            )
+                            pending_uploads.remove(f)
+
+                        shard_idx += 1
+
+            # Process remaining batch
+            if batch:
+                batch_texts = process_batch(batch, batch_seeds)
+                texts.extend(batch_texts)
+                if first_text is None and batch_texts:
+                    first_text = batch_texts[0]
+
+            # Upload remaining full shards
+            while len(texts) >= shard_size:
+                shard_texts = texts[:shard_size]
+                texts = texts[shard_size:]
+
+                shard_path = tmpdir / f"{target_split}-{shard_idx:05d}.parquet"
+                shard_dataset = Dataset.from_dict({"text": shard_texts})
+                shard_dataset.to_parquet(shard_path)
+
+                future = upload_executor.submit(
+                    upload_shard, shard_path, shard_idx, len(shard_texts)
+                )
+                pending_uploads.append(future)
+                shard_idx += 1
 
             # Upload final partial shard if any
             if texts:
@@ -185,14 +255,18 @@ def serialize_and_push(
                 shard_dataset = Dataset.from_dict({"text": texts})
                 shard_dataset.to_parquet(shard_path)
 
-                future = executor.submit(upload_shard, shard_path, shard_idx, len(texts))
+                future = upload_executor.submit(
+                    upload_shard, shard_path, shard_idx, len(texts)
+                )
                 pending_uploads.append(future)
 
             # Wait for all pending uploads to complete
             for future in pending_uploads:
                 idx, count = future.result()
                 total_processed += count
-                tqdm.write(f"  Uploaded {target_split} shard {idx} ({total_processed:,} molecules total)")
+                tqdm.write(
+                    f"  Uploaded {target_split} shard {idx} ({total_processed:,} molecules total)"
+                )
 
     print(f"\nSuccessfully pushed {total_processed:,} molecules to '{target_split}' split in {shard_idx + 1} shards")
     print(f"Dataset URL: https://huggingface.co/datasets/{repo_id}")
@@ -252,6 +326,10 @@ def main():
         "--shard-size", type=int, default=DEFAULT_SHARD_SIZE,
         help=f"Number of molecules per shard (default: {DEFAULT_SHARD_SIZE:,})"
     )
+    parser.add_argument(
+        "--num-workers", "-j", type=int, default=DEFAULT_NUM_WORKERS,
+        help=f"Number of parallel workers for serialization (default: {DEFAULT_NUM_WORKERS})"
+    )
     args = parser.parse_args()
 
     serialize_and_push(
@@ -267,6 +345,7 @@ def main():
         shuffle_seed=args.shuffle_seed,
         private=args.private,
         shard_size=args.shard_size,
+        num_workers=args.num_workers,
     )
 
 
