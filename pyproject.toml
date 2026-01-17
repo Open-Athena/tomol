@@ -10,5 +10,7 @@ dependencies = [
     "numpy>=2.4.1",
     "pandas>=2.3.3",
     "scikit-learn>=1.6.0",
+    "tokenizers>=0.22.2",
     "tqdm>=4.67.1",
+    "transformers>=4.57.6",
 ]

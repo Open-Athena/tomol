@@ -465,14 +465,19 @@ def encode_positions(positions: np.ndarray, codebooks: list[np.ndarray], batch_s
     codes = np.zeros((n_positions, n_levels), dtype=np.int32)
     residuals = positions.copy()
 
-    for level, codebook in enumerate(codebooks):
-        # Process in batches to avoid OOM
-        for start in range(0, n_positions, batch_size):
-            end = min(start + batch_size, n_positions)
-            batch_residuals = residuals[start:end]
-            dists = np.linalg.norm(batch_residuals[:, None, :] - codebook[None, :, :], axis=2)
-            codes[start:end, level] = np.argmin(dists, axis=1)
-        residuals = residuals - codebook[codes[:, level]]
+    n_batches = (n_positions + batch_size - 1) // batch_size
+    total_ops = n_levels * n_batches
+
+    with tqdm(total=total_ops, desc="Encoding positions", leave=False) as pbar:
+        for level, codebook in enumerate(codebooks):
+            # Process in batches to avoid OOM
+            for start in range(0, n_positions, batch_size):
+                end = min(start + batch_size, n_positions)
+                batch_residuals = residuals[start:end]
+                dists = np.linalg.norm(batch_residuals[:, None, :] - codebook[None, :, :], axis=2)
+                codes[start:end, level] = np.argmin(dists, axis=1)
+                pbar.update(1)
+            residuals = residuals - codebook[codes[:, level]]
 
     return codes
 
@@ -593,7 +598,10 @@ def main():
         energy_scale = result["preprocessing"]["energy_scale"]
         energy_shift = result["preprocessing"]["energy_shift"]
 
-        print(f"Loaded codebooks (method: {result['config'].get('method', 'unknown')})")
+        config = result['config']
+        print(f"Loaded codebooks (method: {config.get('method', 'unknown')}, "
+              f"pos_levels={config.get('pos_levels')}, n_levels={config.get('n_levels')}, "
+              f"K={config.get('codebook_size')})")
 
     # Load data for evaluation (needed whether training or loading from checkpoint)
     max_rows = None
@@ -739,17 +747,20 @@ def main():
         print("-" * 40)
 
         # Preprocess using training scales
+        print(f"  Preprocessing {label.lower()} data...")
         pos_data, _ = preprocess_positions(positions_list, scale=pos_scale)
         force_data, _ = preprocess_forces(forces_list, scale=force_scale)
         energy_data = (energies_arr - energy_shift) / energy_scale
 
         # Position reconstruction
+        print(f"  Encoding positions ({len(pos_data):,} vectors)...")
         pos_codes = encode_positions(pos_data, pos_codebooks)
         pos_reconstructed = decode_positions(pos_codes, pos_codebooks)
         pos_err = compute_reconstruction_error(pos_data, pos_reconstructed)
         print(f"  Position - MAE: {pos_err['mae']:.6f}, Median: {pos_err['median_error']:.6f}, RMSE: {pos_err['rmse']:.6f}, Max: {pos_err['max_error']:.6f}")
 
         # Force reconstruction
+        print(f"  Encoding forces ({len(force_data):,} vectors)...")
         force_reconstructed = np.zeros_like(force_data)
         for i, component in enumerate(["x", "y", "z"]):
             codes = encode_1d(force_data[:, i], force_codebooks[component], force_boundaries[component])
@@ -758,6 +769,7 @@ def main():
         print(f"  Force    - MAE: {force_err['mae']:.6f}, Median: {force_err['median_error']:.6f}, RMSE: {force_err['rmse']:.6f}, Max: {force_err['max_error']:.6f}")
 
         # Energy reconstruction
+        print(f"  Encoding energies ({len(energy_data):,} values)...")
         energy_codes = encode_1d(energy_data, energy_codebooks, energy_boundaries)
         energy_reconstructed = decode_1d(energy_codes, energy_codebooks)
         energy_err = compute_reconstruction_error(energy_data, energy_reconstructed)
