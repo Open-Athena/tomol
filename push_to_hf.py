@@ -5,6 +5,7 @@ Streams molecule data, tokenizes using RVQ codebooks, and uploads train/val spli
 """
 
 import argparse
+import random
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
 from pathlib import Path
@@ -12,6 +13,7 @@ from queue import Queue
 from threading import Thread
 
 import datasets
+import pyarrow.parquet as pq
 import numpy as np
 from datasets import Dataset, load_dataset
 from huggingface_hub import HfApi
@@ -70,7 +72,7 @@ def serialize_and_push(
     """
     Serialize molecules and push to HuggingFace Hub with train/val splits.
 
-    First val_size molecules go to validation, rest to train.
+    Uses reservoir sampling to select val_size random molecules for validation.
     """
     tokenizer = MoleculeTokenizer(codebook_path)
     print("Vocabulary Info:")
@@ -82,18 +84,18 @@ def serialize_and_push(
     source_path = Path(source_dataset)
     if source_path.exists():
         if source_path.is_file():
-            ds = load_dataset("parquet", data_files=str(source_path), split="train", num_proc=num_workers)
+            ds = load_dataset("parquet", data_files=str(source_path), split="train", streaming=True)
+            total_rows = pq.read_metadata(source_path).num_rows
         else:
-            ds = load_dataset("parquet", data_dir=str(source_path), split="train", num_proc=num_workers)
-        total_rows = len(ds)
-        print(f"Loaded {total_rows:,} rows, shuffling with seed={seed}...")
-        ds = ds.shuffle(seed=seed)
-        ds = ds.to_iterable_dataset()
+            ds = load_dataset("parquet", data_dir=str(source_path), split="train", streaming=True)
+            total_rows = sum(pq.read_metadata(f).num_rows for f in source_path.glob("*.parquet"))
+        print(f"Found {total_rows:,} rows")
     else:
         ds = load_dataset(source_dataset, split="train", streaming=True)
-        ds = ds.shuffle(seed=seed, buffer_size=10_000)
         total_rows = None
-        print(f"Streaming from HuggingFace (buffer shuffle, seed={seed})")
+
+    random.seed(seed)
+    print(f"Using reservoir sampling for validation (seed={seed})")
 
     ds = ds.select_columns(["atomic_numbers", "positions", "atomic_forces", "energy"])
 
@@ -101,7 +103,7 @@ def serialize_and_push(
     api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
 
     print(f"\nPushing to: {repo_id}")
-    print(f"Validation: first {val_size:,} molecules")
+    print(f"Validation: {val_size:,} molecules (reservoir sampled)")
     print(f"Train: remaining molecules")
     print(f"Using {num_workers} workers")
 
@@ -119,9 +121,9 @@ def serialize_and_push(
     prefetch_thread = Thread(target=prefetch_batches, args=(ds, BATCH_SIZE, batch_queue), daemon=True)
     prefetch_thread.start()
 
-    texts = []
+    reservoir: list[str] = []  # Validation samples
+    train_texts: list[str] = []
     processed = 0
-    val_shard_idx = 0
     train_shard_idx = 0
     pending_uploads: list[Future] = []
 
@@ -143,38 +145,27 @@ def serialize_and_push(
                 pbar.update(len(batch))
 
                 for text in batch_texts:
-                    texts.append(text)
                     processed += 1
 
-                    # Determine current split
-                    in_val = processed <= val_size
-                    split = "validation" if in_val else "train"
-                    shard_idx = val_shard_idx if in_val else train_shard_idx
-
-                    # Flush shard when full OR when transitioning from val to train
-                    flush = len(texts) >= shard_size or (processed == val_size + 1 and len(texts) > 1)
-
-                    if flush:
-                        # When transitioning, the last text belongs to train, so exclude it
-                        if processed == val_size + 1:
-                            shard_texts = texts[:-1]
-                            texts = texts[-1:]
-                            split = "validation"
-                            shard_idx = val_shard_idx
+                    # Reservoir sampling
+                    if len(reservoir) < val_size:
+                        reservoir.append(text)
+                    else:
+                        j = random.randint(0, processed - 1)
+                        if j < val_size:
+                            train_texts.append(reservoir[j])
+                            reservoir[j] = text
                         else:
-                            shard_texts = texts
-                            texts = []
+                            train_texts.append(text)
 
-                        shard_path = tmpdir / f"{split}-{shard_idx:05d}.parquet"
-                        Dataset.from_dict({"text": shard_texts}).to_parquet(shard_path)
-
-                        future = upload_executor.submit(upload_shard, shard_path, split, shard_idx, len(shard_texts))
+                    # Flush train shard when full
+                    if len(train_texts) >= shard_size:
+                        shard_path = tmpdir / f"train-{train_shard_idx:05d}.parquet"
+                        Dataset.from_dict({"text": train_texts}).to_parquet(shard_path)
+                        future = upload_executor.submit(upload_shard, shard_path, "train", train_shard_idx, len(train_texts))
                         pending_uploads.append(future)
-
-                        if split == "validation":
-                            val_shard_idx += 1
-                        else:
-                            train_shard_idx += 1
+                        train_shard_idx += 1
+                        train_texts = []
 
                         # Report completed uploads
                         for f in [f for f in pending_uploads if f.done()]:
@@ -184,13 +175,20 @@ def serialize_and_push(
 
             pbar.close()
 
-            # Final shard
-            if texts:
-                split = "validation" if processed <= val_size else "train"
-                shard_idx = val_shard_idx if split == "validation" else train_shard_idx
-                shard_path = tmpdir / f"{split}-{shard_idx:05d}.parquet"
-                Dataset.from_dict({"text": texts}).to_parquet(shard_path)
-                future = upload_executor.submit(upload_shard, shard_path, split, shard_idx, len(texts))
+            # Final train shard
+            if train_texts:
+                shard_path = tmpdir / f"train-{train_shard_idx:05d}.parquet"
+                Dataset.from_dict({"text": train_texts}).to_parquet(shard_path)
+                future = upload_executor.submit(upload_shard, shard_path, "train", train_shard_idx, len(train_texts))
+                pending_uploads.append(future)
+
+            # Write validation shards from reservoir
+            for i in range(0, len(reservoir), shard_size):
+                shard_texts = reservoir[i:i + shard_size]
+                shard_idx = i // shard_size
+                shard_path = tmpdir / f"validation-{shard_idx:05d}.parquet"
+                Dataset.from_dict({"text": shard_texts}).to_parquet(shard_path)
+                future = upload_executor.submit(upload_shard, shard_path, "validation", shard_idx, len(shard_texts))
                 pending_uploads.append(future)
 
             # Wait for uploads
@@ -199,7 +197,7 @@ def serialize_and_push(
                 tqdm.write(f"  Uploaded {s} shard {idx}")
 
     prefetch_thread.join()
-    print(f"\nDone! Validation: {min(processed, val_size):,}, Train: {max(0, processed - val_size):,}")
+    print(f"\nDone! Validation: {len(reservoir):,}, Train: {processed - len(reservoir):,}")
     print(f"https://huggingface.co/datasets/{repo_id}")
 
 
