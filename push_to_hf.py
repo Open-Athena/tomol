@@ -5,9 +5,11 @@ Dataset downloaded locally with: uv run huggingface-cli download facebook/OMol25
 """
 
 import argparse
+import multiprocessing as mp
 import random
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -19,11 +21,13 @@ from tqdm import tqdm
 from serialize_molecules import MoleculeTokenizer
 
 _tokenizer: MoleculeTokenizer | None = None
+_counter: mp.Value | None = None
 
 
-def _init_worker(codebook_path: str):
-    global _tokenizer
+def _init_worker(codebook_path: str, counter: mp.Value):
+    global _tokenizer, _counter
     _tokenizer = MoleculeTokenizer(codebook_path)
+    _counter = counter
 
 
 def _process_file(args: tuple) -> tuple[list[str], list[str]]:
@@ -35,7 +39,8 @@ def _process_file(args: tuple) -> tuple[list[str], list[str]]:
     row_idx = start_idx
 
     for batch in pf.iter_batches(batch_size=1024, columns=["atomic_numbers", "positions", "atomic_forces", "energy"]):
-        for row in batch.to_pylist():
+        batch_list = batch.to_pylist()
+        for row in batch_list:
             tokens = _tokenizer.encode_molecule(
                 row["atomic_numbers"],
                 np.array(row["positions"]),
@@ -48,6 +53,8 @@ def _process_file(args: tuple) -> tuple[list[str], list[str]]:
             else:
                 train.append(text)
             row_idx += 1
+        with _counter.get_lock():
+            _counter.value += len(batch_list)
     return train, val
 
 
@@ -79,14 +86,31 @@ def main():
     val_indices = frozenset(random.sample(range(total), min(args.val_size, total)))
     print(f"Validation: {len(val_indices):,}, Train: {total - len(val_indices):,}")
 
-    # Process files in parallel
+    # Process files in parallel with live progress
     tasks = [(f, off, val_indices) for f, off in zip(files, offsets)]
     train_all, val_all = [], []
+    counter = mp.Value("q", 0)  # Shared counter for progress
 
-    with ProcessPoolExecutor(args.num_workers, initializer=_init_worker, initargs=(args.codebook,)) as pool:
-        for train, val in tqdm(pool.map(_process_file, tasks), total=len(files), desc="Processing"):
+    with ProcessPoolExecutor(args.num_workers, initializer=_init_worker, initargs=(args.codebook, counter)) as pool:
+        futures = [pool.submit(_process_file, t) for t in tasks]
+        pbar = tqdm(total=total, desc="Processing", unit="mol")
+
+        # Poll counter until all futures complete
+        done = 0
+        while done < len(futures):
+            time.sleep(0.1)
+            pbar.n = counter.value
+            pbar.refresh()
+            done = sum(f.done() for f in futures)
+
+        # Collect results
+        for future in futures:
+            train, val = future.result()
             train_all.extend(train)
             val_all.extend(val)
+
+        pbar.n = counter.value
+        pbar.close()
 
     # Upload shards
     api = HfApi()
