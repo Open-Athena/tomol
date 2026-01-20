@@ -1,11 +1,12 @@
 # moltok
 
-Tokenizer and data prep utilities for turning molecular structures into token sequences using
+Tokenizer and evaluation utilities for turning molecular structures into token sequences using
 Residual Vector Quantization (RVQ) codebooks. This repo focuses on:
 - sampling OMol25 into CSV
 - building RVQ codebooks for positions, forces, and energy
 - serializing molecules into token sequences
 - pushing tokenized shards and the tokenizer to the Hugging Face Hub
+- **evaluating trained models on OMol25 benchmarks** (S2EF + 7 chemistry tasks)
 
 ## Repo Contents
 - `omol_sample_1m_to_csv.py`: stream a 1M sample from `colabfit/OMol25_train` into CSV.
@@ -14,20 +15,26 @@ Residual Vector Quantization (RVQ) codebooks. This repo focuses on:
 - `push_to_hf.py`: tokenize parquet shards and upload dataset shards to HF.
 - `push_tokenizer_to_hf.py`: upload the tokenizer as a HF model repo.
 - `test_roundtrip.py`: round-trip test through HF tokenizer and decode back to molecules.
+- `evaluate_omol25.py`: evaluate trained models on OMol25 S2EF and chemistry benchmarks.
 - `omol25_train_sample_1k.csv`: small sample for quick tests.
 - `codebook_mol_1m.pkl`: prebuilt codebook used by the scripts.
 
 ## Setup
 Python 3.12+ is required.
 
-Install dependencies (one of):
 ```bash
+# Option 1: uv (recommended)
 uv sync
-```
-```bash
+
+# Option 2: pip
 python3 -m venv .venv
 source .venv/bin/activate
-pip install .
+pip install -e .
+```
+
+For GPU support, install PyTorch with CUDA first:
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```
 
 ## Token Format
@@ -97,3 +104,45 @@ python3 test_roundtrip.py
 ```
 This uses `omol25_train_sample_1k.csv`, `codebook_mol_1m.pkl`, and the HF tokenizer repo
 `WillHeld/marin-tomol`.
+
+### 7) Evaluate a trained model on OMol25 benchmarks
+```bash
+# S2EF evaluation on validation set (with metrics)
+python3 evaluate_omol25.py \
+  --model WillHeld/qwen3-omol \
+  --codebook codebook_mol_1m.pkl \
+  --split val \
+  --output predictions_val.npz
+
+# Run all 7 chemistry evaluation tasks
+python3 evaluate_omol25.py \
+  --model WillHeld/qwen3-omol \
+  --codebook codebook_mol_1m.pkl \
+  --run-evals \
+  --eval-output-dir eval_results
+
+# Quick test with limited samples
+python3 evaluate_omol25.py \
+  --model WillHeld/qwen3-omol \
+  --codebook codebook_mol_1m.pkl \
+  --split val \
+  --max-samples 100
+```
+
+#### Evaluation Tasks
+
+| Task | Description | Metric |
+|------|-------------|--------|
+| **S2EF** | Structure to Energy and Forces | Energy MAE (meV/atom), Force MAE (meV/Å) |
+| **conformers** | Identify lowest energy conformer | Accuracy (%) |
+| **distance_scaling** | Energy vs intermolecular distance | MAE (meV) |
+| **ligand_strain** | Bound vs relaxed ligand energy | MAE (meV) |
+| **ligand_pocket** | Protein-ligand interaction energy | MAE (meV) |
+| **protonation** | Protonated vs deprotonated energy (pKa proxy) | MAE (meV) |
+| **ie_ea** | Ionization energy / electron affinity | MAE (meV) |
+| **spin_gap** | Singlet-triplet energy gap | MAE (meV) |
+
+**Note:** This tokenization scheme does not include charge or spin conditioning.
+The model predicts based on geometry alone, which works well for conformers,
+distance_scaling, ligand_strain, and ligand_pocket tasks. For ie_ea and spin_gap,
+the model relies on geometric differences between charge/spin states.
