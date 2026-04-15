@@ -5,6 +5,7 @@ description = "Tokenizer and evaluation utilities for molecular structures using
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.12.0",
     "ase>=3.22.0",
     "datasets>=3.0.0",
     "fairchem-core>=1.3.0",
@@ -18,6 +19,7 @@ dependencies = [
     "torch>=2.0.0",
     "tqdm>=4.66.0",
     "transformers>=4.40.0",
+    "vllm>=0.6.0",
 ]
 
 [project.scripts]

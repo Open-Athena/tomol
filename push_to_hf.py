@@ -30,9 +30,9 @@ _batch_counter = None
 _disk_batch_size = None
 
 
-def _init_worker(codebook_path: str, counter: mp.Value, result_queue: mp.Queue, tmpdir: str, batch_counter: mp.Value, disk_batch_size: int):
+def _init_worker(config_path: str, counter: mp.Value, result_queue: mp.Queue, tmpdir: str, batch_counter: mp.Value, disk_batch_size: int):
     global _tokenizer, _counter, _result_queue, _tmpdir, _batch_counter, _disk_batch_size
-    _tokenizer = MoleculeTokenizer(codebook_path)
+    _tokenizer = MoleculeTokenizer(config_path)
     _counter = counter
     _result_queue = result_queue
     _tmpdir = Path(tmpdir)
@@ -48,6 +48,7 @@ def _flush_to_disk(train: list[str], val: list[str]) -> None:
 
     batch_file = _tmpdir / f"batch_{batch_id:08d}.parquet"
     pq.write_table(pa.table({"train": [train], "val": [val]}), batch_file)
+    print(f"[worker] Wrote batch_{batch_id:08d}.parquet: train={len(train):,}, val={len(val):,}", flush=True)
     _result_queue.put(str(batch_file))
 
 
@@ -193,16 +194,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("source_dir", type=Path)
     parser.add_argument("repo_id")
-    parser.add_argument("--codebook", "-c", default="codebook_mol_1m.pkl")
+    parser.add_argument("--config", "-c", default="fp16_config.json")
     parser.add_argument("--val-size", "-v", type=int, default=100_000)
     parser.add_argument("--shard-size", type=int, default=250_000, help="Records per shard")
-    parser.add_argument("--disk-batch-size", type=int, default=50_000, help="Records per temp file")
+    parser.add_argument("--disk-batch-size", type=int, default=10_000, help="Records per temp file")
     parser.add_argument("--num-workers", "-j", type=int, default=16)
     parser.add_argument("--seed", "-s", type=int, default=42)
     args = parser.parse_args()
 
     # Print vocab info
-    tokenizer = MoleculeTokenizer(args.codebook)
+    tokenizer = MoleculeTokenizer(args.config)
     print("Vocabulary:", tokenizer.get_vocab_info())
 
     # Scan files and compute offsets
@@ -236,29 +237,41 @@ def main():
     pool = mp.Pool(
         args.num_workers,
         initializer=_init_worker,
-        initargs=(args.codebook, counter, result_queue, batch_tmpdir, batch_counter, args.disk_batch_size),
+        initargs=(args.config, counter, result_queue, batch_tmpdir, batch_counter, args.disk_batch_size),
     )
     pool.map_async(_process_file, tasks)
 
     pbar = tqdm(total=total, desc="Processing", unit="mol")
     files_done = 0
 
+    batches_processed = 0
+    last_log = 0
     while files_done < len(files):
         pbar.n = counter.value
         pbar.refresh()
+
+        # Periodic status log
+        if counter.value - last_log >= 100_000:
+            qsize = result_queue.qsize() if hasattr(result_queue, 'qsize') else '?'
+            tqdm.write(f"[main] Progress: {counter.value:,} molecules, queue~{qsize}, batches={batches_processed}, files={files_done}/{len(files)}")
+            last_log = counter.value
 
         try:
             result = result_queue.get(timeout=0.1)
             if result is None:
                 files_done += 1
+                tqdm.write(f"[main] File {files_done}/{len(files)} complete")
             else:
                 # Result is a path to a temp parquet file
                 batch_path = Path(result)
+                tqdm.write(f"[main] Reading batch file: {batch_path.name}")
                 table = pq.read_table(batch_path)
                 train = table["train"][0].as_py()
                 val = table["val"][0].as_py()
                 batch_path.unlink()  # Delete immediately after reading
 
+                batches_processed += 1
+                tqdm.write(f"[main] Batch {batches_processed}: train={len(train):,}, val={len(val):,}")
                 uploader.add_train(train)
                 uploader.add_val(val)
         except Empty:

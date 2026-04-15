@@ -9,46 +9,98 @@ This script supports:
 Note: This model does NOT use charge/spin conditioning. For IE/EA and spin_gap
 tasks, predictions are based on geometry alone.
 
+Data setup:
+    # Download OMol25 validation data (choose one):
+    # Full validation (20GB, 2.76M structures):
+    curl -L -o val.tar.gz "https://dl.fbaipublicfiles.com/opencatalystproject/data/omol/250514/val.tar.gz"
+    # Neutral validation (119MB, 27k structures - faster for testing):
+    curl -L -o neutral_val.tar.gz "https://dl.fbaipublicfiles.com/opencatalystproject/data/omol/250514/neutral_val.tar.gz"
+    tar -xzf neutral_val.tar.gz -C ./omol_data/
+
 Usage:
-    # S2EF evaluation on validation set
+    # S2EF evaluation with vLLM (fast, recommended)
     python evaluate_omol25.py \
-        --model WillHeld/qwen3-omol \
-        --codebook codebook_mol_1m.pkl \
-        --split val \
+        --model WillHeld/ToMol-marin-1B \
+        --config fp16_config.json \
+        --use-vllm \
+        --data-path ./omol_data/neutral_val \
+        --output predictions_val.npz
+
+    # S2EF evaluation with HuggingFace (slower)
+    python evaluate_omol25.py \
+        --model WillHeld/ToMol-marin-1B \
+        --config fp16_config.json \
+        --data-path ./omol_data/neutral_val \
         --output predictions_val.npz
 
     # Run all evaluations
     python evaluate_omol25.py \
-        --model WillHeld/qwen3-omol \
-        --codebook codebook_mol_1m.pkl \
+        --model WillHeld/ToMol-marin-1B \
+        --config fp16_config.json \
+        --use-vllm \
         --run-evals \
         --eval-output-dir eval_results
 """
 
 import argparse
 import json
+import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
-import torch
 from ase import Atoms
 from ase.calculators.calculator import Calculator, all_changes
-from datasets import load_dataset
-from fairchem.core.modules.evaluator import Evaluator as FairChemEvaluator
-from fairchem.data.omol.evals import (
-    conformers,
-    distance_scaling,
-    ie_ea,
-    ligand_pocket,
-    ligand_strain,
-    protonation,
-    spin_gap,
-)
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM
 
 from serialize_molecules import MoleculeTokenizer
+
+# Delay torch import to avoid CUDA init before vLLM
+torch = None
+
+def _get_torch():
+    global torch
+    if torch is None:
+        import torch as _torch
+        torch = _torch
+    return torch
+
+# Optional imports for specialized evals
+FAIRCHEM_AVAILABLE = False
+FairChemEvaluator = None
+OMOL_EVALS_AVAILABLE = False
+
+def _init_optional_imports():
+    global FAIRCHEM_AVAILABLE, FairChemEvaluator, OMOL_EVALS_AVAILABLE
+    global conformers, distance_scaling, ie_ea, ligand_pocket, ligand_strain, protonation, spin_gap
+
+    try:
+        from fairchem.core.modules.evaluator import Evaluator as _FairChemEvaluator
+        FairChemEvaluator = _FairChemEvaluator
+        FAIRCHEM_AVAILABLE = True
+    except ImportError:
+        pass
+
+    try:
+        from fairchem.data.omol.evals import (
+            conformers as _conformers,
+            distance_scaling as _distance_scaling,
+            ie_ea as _ie_ea,
+            ligand_pocket as _ligand_pocket,
+            ligand_strain as _ligand_strain,
+            protonation as _protonation,
+            spin_gap as _spin_gap,
+        )
+        conformers = _conformers
+        distance_scaling = _distance_scaling
+        ie_ea = _ie_ea
+        ligand_pocket = _ligand_pocket
+        ligand_strain = _ligand_strain
+        protonation = _protonation
+        spin_gap = _spin_gap
+        OMOL_EVALS_AVAILABLE = True
+    except ImportError:
+        pass
 
 
 # =============================================================================
@@ -69,18 +121,24 @@ class Qwen3MolCalculator(Calculator):
     def __init__(
         self,
         model_name_or_path: str,
-        codebook_path: str,
+        config_path: str,
         device: str = "cuda",
         max_new_tokens: int = 512,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: str = "bfloat16",
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.device = device
         self.max_new_tokens = max_new_tokens
 
+        torch = _get_torch()
+        from transformers import AutoModelForCausalLM
+
+        dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+        torch_dtype = dtype_map.get(dtype, torch.bfloat16)
+
         # Load moltok tokenizer with codebook
-        self.mol_tokenizer = MoleculeTokenizer(codebook_path)
+        self.mol_tokenizer = MoleculeTokenizer(config_path)
         self.vocab_info = self.mol_tokenizer.get_vocab_info()
 
         # Load HuggingFace tokenizer
@@ -90,7 +148,7 @@ class Qwen3MolCalculator(Calculator):
         print(f"Loading model from {model_name_or_path}...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
-            torch_dtype=dtype,
+            torch_dtype=torch_dtype,
             device_map=device,
             trust_remote_code=True,
         )
@@ -117,6 +175,7 @@ class Qwen3MolCalculator(Calculator):
         input_tokens = self._build_input_prompt(atomic_numbers, positions)
 
         # Generate completion
+        torch = _get_torch()
         input_ids = torch.tensor([input_tokens], device=self.device)
 
         with torch.no_grad():
@@ -182,6 +241,148 @@ class Qwen3MolCalculator(Calculator):
 
 
 # =============================================================================
+# vLLM-based Calculator (fast batched inference)
+# =============================================================================
+
+
+class VLLMMolCalculator(Calculator):
+    """
+    ASE-compatible calculator using vLLM for fast batched inference.
+
+    This calculator supports both single-molecule and batched prediction.
+    For best performance, use predict_batch() directly instead of ASE interface.
+    """
+
+    implemented_properties = ["energy", "forces"]
+
+    def __init__(
+        self,
+        model_name_or_path: str,
+        config_path: str,
+        max_new_tokens: int = 2048,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.max_new_tokens = max_new_tokens
+
+        # Load moltok tokenizer with codebook
+        self.mol_tokenizer = MoleculeTokenizer(config_path)
+        self.vocab_info = self.mol_tokenizer.get_vocab_info()
+        self.hf_tokenizer = self.mol_tokenizer.get_hf_tokenizer()
+
+        # Get special token IDs
+        self.eos_id = self.vocab_info["special_tokens"]["[EOS]"]
+        self.force_id = self.vocab_info["special_tokens"]["[FORCE]"]
+
+        # Load vLLM
+        from vllm import LLM, SamplingParams
+
+        print(f"Loading model with vLLM from {model_name_or_path}...")
+        self.llm = LLM(
+            model=model_name_or_path,
+            dtype="bfloat16",
+            trust_remote_code=True,
+        )
+
+        self.sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=0,  # greedy
+            stop_token_ids=[self.eos_id],
+        )
+        print("vLLM model loaded!")
+
+    def _build_prompt(self, atomic_numbers: np.ndarray, positions: np.ndarray) -> str:
+        """Build input prompt string for a molecule."""
+        full_tokens = self.mol_tokenizer.encode_molecule(
+            atomic_numbers=atomic_numbers.tolist() if hasattr(atomic_numbers, 'tolist') else list(atomic_numbers),
+            positions=positions,
+            forces=np.zeros_like(positions),
+            energy=0.0,
+            shuffle_sections=False,
+        )
+        force_idx = full_tokens.index(self.force_id)
+        input_tokens = full_tokens[:force_idx + 1]
+        return self.mol_tokenizer.tokens_to_string(input_tokens)
+
+    def _parse_output(self, prompt: str, generated_text: str, n_atoms: int) -> dict:
+        """Parse vLLM output to extract forces and energy."""
+        full_text = prompt + " " + generated_text
+        token_ids = self.hf_tokenizer.encode(full_text, add_special_tokens=False)
+
+        try:
+            decoded = self.mol_tokenizer.decode_molecule(token_ids)
+            forces = decoded.get("forces")
+            energy = decoded.get("energy")
+
+            if forces is None or len(forces) != n_atoms:
+                forces = np.zeros((n_atoms, 3))
+            if energy is None:
+                energy = 0.0
+
+            return {"energy": float(energy), "forces": np.array(forces)}
+        except Exception as e:
+            return {"energy": 0.0, "forces": np.zeros((n_atoms, 3))}
+
+    def calculate(
+        self,
+        atoms: Atoms = None,
+        properties: list[str] = None,
+        system_changes: list = all_changes,
+    ):
+        """Calculate energy and forces for a single molecule (ASE interface)."""
+        super().calculate(atoms, properties, system_changes)
+
+        atomic_numbers = atoms.get_atomic_numbers()
+        positions = atoms.get_positions()
+        n_atoms = len(atomic_numbers)
+
+        prompt = self._build_prompt(atomic_numbers, positions)
+        outputs = self.llm.generate([prompt], self.sampling_params)
+        generated_text = outputs[0].outputs[0].text
+
+        result = self._parse_output(prompt, generated_text, n_atoms)
+        self.results = result
+
+    def predict_batch(
+        self,
+        samples: list[dict],
+        show_progress: bool = True,
+    ) -> list[dict]:
+        """
+        Predict energy and forces for a batch of molecules.
+
+        Args:
+            samples: List of dicts with 'atomic_numbers' and 'positions'
+            show_progress: Show progress bar
+
+        Returns:
+            List of dicts with 'energy' and 'forces'
+        """
+        # Build all prompts
+        prompts = []
+        n_atoms_list = []
+        for sample in samples:
+            atomic_numbers = sample["atomic_numbers"]
+            positions = sample["positions"]
+            n_atoms_list.append(len(atomic_numbers))
+            prompts.append(self._build_prompt(atomic_numbers, positions))
+
+        # Run batched inference
+        if show_progress:
+            print(f"Running vLLM inference on {len(prompts)} samples...")
+        outputs = self.llm.generate(prompts, self.sampling_params)
+
+        # Parse results
+        results = []
+        for i, output in enumerate(outputs):
+            generated_text = output.outputs[0].text
+            result = self._parse_output(prompts[i], generated_text, n_atoms_list[i])
+            results.append(result)
+
+        return results
+
+
+# =============================================================================
 # Metrics Computation (using FAIRChem Evaluator)
 # =============================================================================
 
@@ -194,43 +395,57 @@ def compute_s2ef_metrics(
     natoms: np.ndarray,
 ) -> dict:
     """
-    Compute S2EF metrics using FAIRChem's official Evaluator.
+    Compute S2EF metrics.
 
+    Uses FAIRChem's Evaluator if available, otherwise computes basic metrics.
     Reports energy in meV/atom and forces in meV/Å.
     """
-    evaluator = FairChemEvaluator(task="s2ef")
-
     all_pred_forces = np.concatenate(pred_forces, axis=0)
     all_target_forces = np.concatenate(target_forces, axis=0)
 
-    prediction = {
-        "energy": torch.tensor(pred_energies, dtype=torch.float32),
-        "forces": torch.tensor(all_pred_forces, dtype=torch.float32),
-        "natoms": torch.tensor(natoms, dtype=torch.long),
-    }
-    target = {
-        "energy": torch.tensor(target_energies, dtype=torch.float32),
-        "forces": torch.tensor(all_target_forces, dtype=torch.float32),
-        "natoms": torch.tensor(natoms, dtype=torch.long),
-    }
+    if FAIRCHEM_AVAILABLE and FairChemEvaluator is not None:
+        torch = _get_torch()
+        evaluator = FairChemEvaluator(task="s2ef")
 
-    metrics_raw = evaluator.eval(prediction, target)
+        prediction = {
+            "energy": torch.tensor(pred_energies, dtype=torch.float32),
+            "forces": torch.tensor(all_pred_forces, dtype=torch.float32),
+            "natoms": torch.tensor(natoms, dtype=torch.long),
+        }
+        target = {
+            "energy": torch.tensor(target_energies, dtype=torch.float32),
+            "forces": torch.tensor(all_target_forces, dtype=torch.float32),
+            "natoms": torch.tensor(natoms, dtype=torch.long),
+        }
 
-    # Convert to meV and meV/Å
-    metrics = {
-        "energy_mae_meV": float(metrics_raw.get("energy_mae", {}).get("metric", 0)) * 1000,
-        "force_mae_meV_A": float(metrics_raw.get("forces_mae", {}).get("metric", 0)) * 1000,
-        "forcesx_mae_meV_A": float(metrics_raw.get("forcesx_mae", {}).get("metric", 0)) * 1000,
-        "forcesy_mae_meV_A": float(metrics_raw.get("forcesy_mae", {}).get("metric", 0)) * 1000,
-        "forcesz_mae_meV_A": float(metrics_raw.get("forcesz_mae", {}).get("metric", 0)) * 1000,
-        "force_cosine": float(metrics_raw.get("cosine_similarity", {}).get("metric", 0)),
-        "force_magnitude_error_meV_A": float(
-            metrics_raw.get("magnitude_error", {}).get("metric", 0)
-        ) * 1000,
-        "efwt": float(metrics_raw.get("energy_forces_within_threshold", {}).get("metric", 0)),
-        "n_structures": len(pred_energies),
-        "n_atoms": len(all_pred_forces),
-    }
+        metrics_raw = evaluator.eval(prediction, target)
+
+        # Convert to meV and meV/Å
+        metrics = {
+            "energy_mae_meV": float(metrics_raw.get("energy_mae", {}).get("metric", 0)) * 1000,
+            "force_mae_meV_A": float(metrics_raw.get("forces_mae", {}).get("metric", 0)) * 1000,
+            "forcesx_mae_meV_A": float(metrics_raw.get("forcesx_mae", {}).get("metric", 0)) * 1000,
+            "forcesy_mae_meV_A": float(metrics_raw.get("forcesy_mae", {}).get("metric", 0)) * 1000,
+            "forcesz_mae_meV_A": float(metrics_raw.get("forcesz_mae", {}).get("metric", 0)) * 1000,
+            "force_cosine": float(metrics_raw.get("cosine_similarity", {}).get("metric", 0)),
+            "force_magnitude_error_meV_A": float(
+                metrics_raw.get("magnitude_error", {}).get("metric", 0)
+            ) * 1000,
+            "efwt": float(metrics_raw.get("energy_forces_within_threshold", {}).get("metric", 0)),
+            "n_structures": len(pred_energies),
+            "n_atoms": len(all_pred_forces),
+        }
+    else:
+        # Basic metrics without FAIRChem
+        energy_mae = np.mean(np.abs(pred_energies - target_energies))
+        force_mae = np.mean(np.abs(all_pred_forces - all_target_forces))
+
+        metrics = {
+            "energy_mae_meV": float(energy_mae) * 1000,
+            "force_mae_meV_A": float(force_mae) * 1000,
+            "n_structures": len(pred_energies),
+            "n_atoms": len(all_pred_forces),
+        }
 
     return metrics
 
@@ -246,14 +461,17 @@ def print_metrics_table(metrics: dict) -> None:
 
     print("\nForce Metrics:")
     print(f"  {'MAE':<25} {metrics['force_mae_meV_A']:>12.2f} meV/Å")
-    print(f"  {'MAE (x-component)':<25} {metrics['forcesx_mae_meV_A']:>12.2f} meV/Å")
-    print(f"  {'MAE (y-component)':<25} {metrics['forcesy_mae_meV_A']:>12.2f} meV/Å")
-    print(f"  {'MAE (z-component)':<25} {metrics['forcesz_mae_meV_A']:>12.2f} meV/Å")
-    print(f"  {'Magnitude error':<25} {metrics['force_magnitude_error_meV_A']:>12.2f} meV/Å")
-    print(f"  {'Cosine similarity':<25} {metrics['force_cosine']:>12.4f}")
 
-    print("\nThreshold Metrics:")
-    print(f"  {'EFwT (E<20meV, F<30meV/Å)':<25} {metrics['efwt']*100:>11.2f}%")
+    # Additional metrics only available with FAIRChem evaluator
+    if 'forcesx_mae_meV_A' in metrics:
+        print(f"  {'MAE (x-component)':<25} {metrics['forcesx_mae_meV_A']:>12.2f} meV/Å")
+        print(f"  {'MAE (y-component)':<25} {metrics['forcesy_mae_meV_A']:>12.2f} meV/Å")
+        print(f"  {'MAE (z-component)':<25} {metrics['forcesz_mae_meV_A']:>12.2f} meV/Å")
+        print(f"  {'Magnitude error':<25} {metrics['force_magnitude_error_meV_A']:>12.2f} meV/Å")
+        print(f"  {'Cosine similarity':<25} {metrics['force_cosine']:>12.4f}")
+
+        print("\nThreshold Metrics:")
+        print(f"  {'EFwT (E<20meV, F<30meV/Å)':<25} {metrics['efwt']*100:>11.2f}%")
 
     print("\nDataset Stats:")
     print(f"  {'Structures':<25} {metrics['n_structures']:>12,}")
@@ -267,39 +485,58 @@ def print_metrics_table(metrics: dict) -> None:
 
 
 class OMol25Dataset:
-    """Dataset for loading OMol25 validation/test structures."""
+    """Dataset for loading OMol25 validation/test structures.
+
+    Downloads data from: https://dl.fbaipublicfiles.com/opencatalystproject/data/omol/
+    See: https://huggingface.co/facebook/OMol25/blob/main/DATASET.md
+
+    Usage:
+        # First download and extract the data:
+        # curl -L -o val.tar.gz "https://dl.fbaipublicfiles.com/opencatalystproject/data/omol/250514/val.tar.gz"
+        # tar -xzf val.tar.gz
+
+        dataset = OMol25Dataset(data_path="./val")
+    """
 
     def __init__(
         self,
-        split: str = "val",
+        data_path: str,
         max_samples: Optional[int] = None,
         load_labels: bool = True,
     ):
-        self.split = split
+        self.data_path = data_path
         self.samples = []
-        self.has_labels = load_labels and split == "val"
+        self.has_labels = load_labels
 
-        print(f"Loading OMol25 {split} split from HuggingFace...")
+        print(f"Loading OMol25 data from {data_path}...")
 
-        split_name = "validation" if split == "val" else "test"
-        ds = load_dataset("facebook/OMol25", split=split_name, streaming=True)
+        from fairchem.core.datasets import AseDBDataset
 
-        for i, sample in enumerate(tqdm(ds, desc=f"Loading {split}")):
-            if max_samples and i >= max_samples:
-                break
+        ase_dataset = AseDBDataset({"src": data_path})
+        n_samples = len(ase_dataset)
+
+        if max_samples:
+            n_samples = min(n_samples, max_samples)
+
+        print(f"Loading {n_samples} samples...")
+
+        for i in tqdm(range(n_samples), desc="Loading"):
+            atoms = ase_dataset.get_atoms(i)
 
             item = {
-                "id": sample.get("id", str(i)),
-                "atomic_numbers": np.array(sample["atomic_numbers"]),
-                "positions": np.array(sample["positions"]),
-                "natoms": len(sample["atomic_numbers"]),
+                "id": atoms.info.get("source", str(i)),
+                "atomic_numbers": atoms.get_atomic_numbers(),
+                "positions": atoms.get_positions(),
+                "natoms": len(atoms),
             }
 
             if self.has_labels:
-                item["energy_target"] = sample.get("energy", sample.get("total_energy"))
-                item["forces_target"] = np.array(sample.get("forces", []))
+                item["energy_target"] = atoms.get_potential_energy()
+                item["forces_target"] = atoms.get_forces()
 
             self.samples.append(item)
+
+        print(f"Loaded {len(self.samples)} samples")
 
     def __len__(self):
         return len(self.samples)
@@ -314,11 +551,52 @@ class OMol25Dataset:
 
 
 def evaluate_s2ef(
-    calculator: Qwen3MolCalculator,
+    calculator: Union[Qwen3MolCalculator, "VLLMMolCalculator"],
     dataset: OMol25Dataset,
     output_path: str,
+    batch_size: int = 32,
 ) -> dict:
     """Run S2EF evaluation and save predictions in leaderboard format."""
+    print(f"\nRunning S2EF evaluation on {len(dataset)} structures...")
+    if dataset.has_labels:
+        print("Ground truth labels available - will compute running metrics.")
+
+    samples_list = list(dataset.samples)
+
+    # Check if using vLLM (continuous batching)
+    if hasattr(calculator, 'llm'):
+        return _evaluate_s2ef_vllm(calculator, samples_list, dataset.has_labels, output_path)
+    else:
+        return _evaluate_s2ef_sequential(calculator, samples_list, dataset.has_labels, output_path)
+
+
+def _evaluate_s2ef_vllm(
+    calculator: "VLLMMolCalculator",
+    samples: list[dict],
+    has_labels: bool,
+    output_path: str,
+) -> dict:
+    """Run S2EF with vLLM continuous batching and running metrics."""
+    import time
+
+    # Build all prompts upfront
+    print("Building prompts...")
+    prompts = []
+    n_atoms_list = []
+    for sample in tqdm(samples, desc="Building prompts"):
+        prompt = calculator._build_prompt(sample["atomic_numbers"], sample["positions"])
+        prompts.append(prompt)
+        n_atoms_list.append(len(sample["atomic_numbers"]))
+
+    # Submit all to vLLM at once - it handles continuous batching internally
+    print(f"\nSubmitting {len(prompts)} prompts to vLLM (continuous batching)...")
+    start_time = time.time()
+    outputs = calculator.llm.generate(prompts, calculator.sampling_params)
+    elapsed = time.time() - start_time
+    print(f"Inference complete in {elapsed:.1f}s ({len(prompts)/elapsed:.1f} samples/sec)")
+
+    # Parse results with running metrics
+    print("\nParsing outputs and computing metrics...")
     all_ids = []
     all_energies = []
     all_forces = []
@@ -326,28 +604,38 @@ def evaluate_s2ef(
     all_target_energies = []
     all_target_forces = []
 
-    print(f"\nRunning S2EF evaluation on {len(dataset)} structures...")
-    if dataset.has_labels:
-        print("Ground truth labels available - will compute metrics.")
+    # Running metrics
+    energy_errors = []
+    force_errors = []
+    last_report = 0
+    report_interval = max(1, len(samples) // 20)  # Report ~20 times
 
-    for sample in tqdm(dataset, desc="Predicting"):
-        atoms = Atoms(
-            numbers=sample["atomic_numbers"],
-            positions=sample["positions"],
-        )
-        atoms.calc = calculator
-
-        energy = atoms.get_potential_energy()
-        forces = atoms.get_forces()
+    for i, (output, sample) in enumerate(zip(outputs, samples)):
+        generated_text = output.outputs[0].text
+        result = calculator._parse_output(prompts[i], generated_text, n_atoms_list[i])
 
         all_ids.append(sample["id"])
-        all_energies.append(energy)
-        all_forces.append(forces)
+        all_energies.append(result["energy"])
+        all_forces.append(result["forces"])
         all_natoms.append(sample["natoms"])
 
-        if dataset.has_labels:
-            all_target_energies.append(sample["energy_target"])
-            all_target_forces.append(sample["forces_target"])
+        if has_labels:
+            target_energy = sample["energy_target"]
+            target_forces = sample["forces_target"]
+            all_target_energies.append(target_energy)
+            all_target_forces.append(target_forces)
+
+            # Track errors for running metrics
+            energy_errors.append(abs(result["energy"] - target_energy))
+            force_errors.append(np.mean(np.abs(result["forces"] - target_forces)))
+
+            # Report running metrics periodically
+            if (i + 1) - last_report >= report_interval or i == len(samples) - 1:
+                energy_mae = np.mean(energy_errors) * 1000  # meV
+                force_mae = np.mean(force_errors) * 1000    # meV/Å
+                pct = 100 * (i + 1) / len(samples)
+                print(f"  [{i+1:>6}/{len(samples)}] ({pct:5.1f}%) | Energy MAE: {energy_mae:8.2f} meV | Force MAE: {force_mae:8.2f} meV/Å")
+                last_report = i + 1
 
     # Save predictions
     all_forces_concat = np.concatenate(all_forces, axis=0)
@@ -366,8 +654,95 @@ def evaluate_s2ef(
         "output_path": output_path,
     }
 
-    # Compute metrics if labels available
-    if dataset.has_labels and all_target_energies:
+    # Final metrics
+    if has_labels and all_target_energies:
+        metrics = compute_s2ef_metrics(
+            pred_energies=np.array(all_energies),
+            pred_forces=all_forces,
+            target_energies=np.array(all_target_energies),
+            target_forces=all_target_forces,
+            natoms=np.array(all_natoms),
+        )
+        print_metrics_table(metrics)
+        result["metrics"] = metrics
+
+        metrics_path = output_path.replace(".npz", "_metrics.json")
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"\nMetrics saved to {metrics_path}")
+
+    return result
+
+
+def _evaluate_s2ef_sequential(
+    calculator: Qwen3MolCalculator,
+    samples: list[dict],
+    has_labels: bool,
+    output_path: str,
+) -> dict:
+    """Run S2EF with sequential inference (HuggingFace backend)."""
+    all_ids = []
+    all_energies = []
+    all_forces = []
+    all_natoms = []
+    all_target_energies = []
+    all_target_forces = []
+
+    energy_errors = []
+    force_errors = []
+    last_report = 0
+    report_interval = max(1, len(samples) // 20)
+
+    print("Using sequential inference...")
+    for i, sample in enumerate(tqdm(samples, desc="Predicting")):
+        atoms = Atoms(
+            numbers=sample["atomic_numbers"],
+            positions=sample["positions"],
+        )
+        atoms.calc = calculator
+
+        energy = atoms.get_potential_energy()
+        forces = atoms.get_forces()
+
+        all_ids.append(sample["id"])
+        all_energies.append(energy)
+        all_forces.append(forces)
+        all_natoms.append(sample["natoms"])
+
+        if has_labels:
+            target_energy = sample["energy_target"]
+            target_forces = sample["forces_target"]
+            all_target_energies.append(target_energy)
+            all_target_forces.append(target_forces)
+
+            energy_errors.append(abs(energy - target_energy))
+            force_errors.append(np.mean(np.abs(forces - target_forces)))
+
+            if (i + 1) - last_report >= report_interval or i == len(samples) - 1:
+                energy_mae = np.mean(energy_errors) * 1000
+                force_mae = np.mean(force_errors) * 1000
+                pct = 100 * (i + 1) / len(samples)
+                print(f"  [{i+1:>6}/{len(samples)}] ({pct:5.1f}%) | Energy MAE: {energy_mae:8.2f} meV | Force MAE: {force_mae:8.2f} meV/Å")
+                last_report = i + 1
+
+    # Save predictions
+    all_forces_concat = np.concatenate(all_forces, axis=0)
+    np.savez_compressed(
+        output_path,
+        ids=np.array(all_ids),
+        energy=np.array(all_energies),
+        forces=all_forces_concat,
+        natoms=np.array(all_natoms),
+    )
+    print(f"\nPredictions saved to {output_path}")
+
+    result = {
+        "n_structures": len(all_ids),
+        "n_force_vectors": len(all_forces_concat),
+        "output_path": output_path,
+    }
+
+    if has_labels and all_target_energies:
         metrics = compute_s2ef_metrics(
             pred_energies=np.array(all_energies),
             pred_forces=all_forces,
@@ -787,11 +1162,16 @@ def run_ligand_pocket_eval(calculator: Calculator, output_dir: Path) -> dict:
 
 
 def run_specialized_evals(
-    calculator: Qwen3MolCalculator,
+    calculator: Union[Qwen3MolCalculator, "VLLMMolCalculator"],
     tasks: list[str],
     output_dir: str,
 ) -> dict:
     """Run the specialized chemistry evaluation tasks."""
+    if not OMOL_EVALS_AVAILABLE:
+        print("WARNING: fairchem.data.omol.evals not available, skipping specialized evals")
+        print("Install with: pip install fairchem-data-omol")
+        return {"error": "fairchem.data.omol.evals not available"}
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -864,16 +1244,16 @@ def main():
         help="HuggingFace model name or local path",
     )
     parser.add_argument(
-        "--codebook",
+        "--config",
         type=str,
-        default="codebook_mol_1m.pkl",
-        help="Path to moltok codebook pickle file",
+        default="fp16_config.json",
+        help="Path to FP16 tokenizer config JSON file",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run on",
+        default="cuda",
+        help="Device to run on (for HuggingFace backend)",
     )
     parser.add_argument(
         "--dtype",
@@ -883,11 +1263,27 @@ def main():
         help="Model dtype",
     )
     parser.add_argument(
-        "--split",
+        "--use-vllm",
+        action="store_true",
+        help="Use vLLM for fast batched inference (recommended)",
+    )
+    parser.add_argument(
+        "--hf-cache-dir",
         type=str,
-        default="val",
-        choices=["val", "test"],
-        help="Dataset split for S2EF evaluation",
+        default="./hf_cache",
+        help="Directory for HuggingFace cache (default: ./hf_cache)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size for vLLM inference",
+    )
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default="./omol_data/neutral_val",
+        help="Path to OMol25 data directory (aselmdb files)",
     )
     parser.add_argument(
         "--max-samples",
@@ -930,7 +1326,7 @@ def main():
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=512,
+        default=2048,
         help="Max new tokens to generate per molecule",
     )
     parser.add_argument(
@@ -941,38 +1337,47 @@ def main():
 
     args = parser.parse_args()
 
-    dtype_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
+    # Set HuggingFace cache directory
+    cache_dir = os.path.abspath(args.hf_cache_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ["HF_HOME"] = cache_dir
+    os.environ["HF_HUB_CACHE"] = cache_dir
 
     print("=" * 60)
     print("OMol25 Evaluation")
     print("=" * 60)
     print(f"Model: {args.model}")
-    print(f"Device: {args.device}")
+    print(f"Backend: {'vLLM (fast)' if args.use_vllm else 'HuggingFace'}")
+    print(f"HF Cache: {cache_dir}")
     print(f"NOTE: This model has NO charge/spin conditioning")
     print("=" * 60)
 
-    calculator = Qwen3MolCalculator(
-        model_name_or_path=args.model,
-        codebook_path=args.codebook,
-        device=args.device,
-        max_new_tokens=args.max_new_tokens,
-        dtype=dtype_map[args.dtype],
-    )
+    # Create calculator
+    if args.use_vllm:
+        calculator = VLLMMolCalculator(
+            model_name_or_path=args.model,
+            config_path=args.config,
+            max_new_tokens=args.max_new_tokens,
+        )
+    else:
+        calculator = Qwen3MolCalculator(
+            model_name_or_path=args.model,
+            config_path=args.config,
+            device=args.device,
+            max_new_tokens=args.max_new_tokens,
+            dtype=args.dtype,
+        )
 
     results = {}
 
     # S2EF evaluation
     if not args.skip_s2ef:
         print(f"\n{'='*60}")
-        print(f"S2EF Evaluation ({args.split} split)")
+        print(f"S2EF Evaluation ({args.data_path})")
         print(f"{'='*60}")
 
         dataset = OMol25Dataset(
-            split=args.split,
+            data_path=args.data_path,
             max_samples=args.max_samples,
         )
 
@@ -980,6 +1385,7 @@ def main():
             calculator=calculator,
             dataset=dataset,
             output_path=args.output,
+            batch_size=args.batch_size,
         )
         results["s2ef"] = s2ef_results
 

@@ -13,38 +13,29 @@
 # limitations under the License.
 
 """
-Stream a 1M approximate random sample from colabfit/OMol25_train and write it to CSV.
+Sample 1M rows from local OMol25 parquet files and write to CSV.
 
-Uses Hugging Face streaming shuffle with a fixed buffer for single-pass sampling.
+Uses local parquet files from HuggingFace cache.
 """
 
 import csv
 import json
-import os
+import random
 from pathlib import Path
 
-import datasets
-from datasets import load_dataset
-from huggingface_hub import get_token
-from tqdm.auto import tqdm
+import pyarrow.parquet as pq
+from tqdm import tqdm
 
-DATASET_ID = "colabfit/OMol25_train"
-DATASET_REVISION = "main"
+# Local parquet directory
+PARQUET_DIR = Path("./hf_cache/hub/datasets--colabfit--OMol25_train/snapshots/cf406cd59287d88e41df6f354c0d41a34cb13dc3/co/")
 SAMPLE_SIZE = 1_000_000
 OUTPUT_PATH = Path("omol25_train_sample_1m.csv")
 SHUFFLE_SEED = 0
-SHUFFLE_BUFFER = 10_000
 COLUMNS = [
-    "property_id",
-    "configuration_id",
-    "dataset_id",
     "atomic_numbers",
     "positions",
     "atomic_forces",
     "energy",
-    "multiplicity",
-    "cell",
-    "pbc",
 ]
 
 
@@ -55,30 +46,60 @@ def _jsonify(value: object) -> object:
 
 
 def _write_csv() -> None:
-    token = get_token()
-    if token:
-        os.environ.setdefault("HF_TOKEN", token)
-        os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", token)
+    random.seed(SHUFFLE_SEED)
 
-    datasets.disable_caching()
-    ds = (
-        load_dataset(
-        DATASET_ID,
-        revision=DATASET_REVISION,
-        split="train",
-        streaming=True,
-        )
-        .select_columns(COLUMNS)
-        .shuffle(seed=SHUFFLE_SEED, buffer_size=SHUFFLE_BUFFER)
-        .take(SAMPLE_SIZE)
-    )
+    # Find all parquet files
+    files = sorted(PARQUET_DIR.glob("*.parquet"))
+    print(f"Found {len(files)} parquet files")
 
+    # Count total rows and build index
+    print("Counting rows...")
+    file_info = []
+    total_rows = 0
+    for f in tqdm(files, desc="Scanning files"):
+        pf = pq.ParquetFile(f)
+        num_rows = pf.metadata.num_rows
+        file_info.append((f, total_rows, num_rows))
+        total_rows += num_rows
+
+    print(f"Total rows available: {total_rows:,}")
+    sample_size = min(SAMPLE_SIZE, total_rows)
+    print(f"Sampling {sample_size:,} rows...")
+
+    # Generate random indices to sample
+    sample_indices = set(random.sample(range(total_rows), sample_size))
+
+    # Read and write samples
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    samples_written = 0
+
     with OUTPUT_PATH.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=COLUMNS)
         writer.writeheader()
-        for row in tqdm(ds, total=SAMPLE_SIZE, desc="Writing sample"):
-            writer.writerow({key: _jsonify(row.get(key)) for key in COLUMNS})
+
+        global_idx = 0
+        for filepath, start_idx, num_rows in tqdm(file_info, desc="Processing files"):
+            # Check if any samples are in this file
+            file_end = start_idx + num_rows
+            file_samples = [i for i in range(start_idx, file_end) if i in sample_indices]
+
+            if not file_samples:
+                global_idx = file_end
+                continue
+
+            # Read the file
+            table = pq.read_table(filepath, columns=COLUMNS)
+            batch = table.to_pylist()
+
+            for local_idx, row in enumerate(batch):
+                global_row_idx = start_idx + local_idx
+                if global_row_idx in sample_indices:
+                    writer.writerow({key: _jsonify(row.get(key)) for key in COLUMNS})
+                    samples_written += 1
+
+            global_idx = file_end
+
+    print(f"\nWrote {samples_written:,} samples to {OUTPUT_PATH}")
 
 
 def main() -> None:

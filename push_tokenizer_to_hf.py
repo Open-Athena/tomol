@@ -13,12 +13,12 @@ def main():
     parser = argparse.ArgumentParser(description="Push tokenizer to HuggingFace Hub")
     parser.add_argument("--repo-id", "-r", default="WillHeld/marin-tomol",
                         help="HuggingFace repo ID")
-    parser.add_argument("--codebook", "-c", default="codebook_mol_1m.pkl",
-                        help="Path to codebook pickle file")
+    parser.add_argument("--config", "-c", default="fp16_config.json",
+                        help="Path to FP16 config JSON file")
     args = parser.parse_args()
 
-    print(f"Loading tokenizer from {args.codebook}...")
-    tokenizer = MoleculeTokenizer(args.codebook)
+    print(f"Loading tokenizer from {args.config}...")
+    tokenizer = MoleculeTokenizer(args.config)
     print(f"Vocabulary size: {tokenizer.vocab_size}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
